@@ -114,7 +114,7 @@ python -c "import funasr, torch; print(funasr.__version__, torch.cuda.is_availab
 
 ### meeting-notes-expert（文字 → 纪要）
 
-五段式纪要（基本信息 / 会议内容 / 核心要点 / 会议总结 / 待办表格）；「一个议题只说一次」去重红线；关键决策标注状态（已定/待定/待确认）与可溯源依据；待办七列表（含验收标准），按优先级→时间排序；内置公文排版规范（A4、宋体/仿宋分级字号、Word 导航标题）。详见 [skills/meeting-notes-expert/SKILL.md](skills/meeting-notes-expert/SKILL.md)。
+五段式纪要（基本信息 / 会议内容 / 核心要点 / 会议总结 / 待办表格）；「一个议题只说一次」去重红线；关键决策标注状态（已定/待定/待确认）与可溯源依据；待办七列表（含验收标准），按优先级→时间排序；遵循全局文章排版规范（黑体标题/宋体正文/Word 自动编号/导航目录）。详见 [skills/meeting-notes-expert/SKILL.md](skills/meeting-notes-expert/SKILL.md)。
 
 ## ⚠️ 已知限制
 
