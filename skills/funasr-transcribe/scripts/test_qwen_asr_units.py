@@ -5,7 +5,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from qwen_asr import (split_sentences, char_times, fmt_srt_ts, merge_by_speaker,
                       subtitle_units, PUNCT, apply_replace, build_matcher,
-                      aed_ts_usable, aed_aligns_from)
+                      aed_ts_usable, aed_aligns_from,
+                      merge_short_segments, split_long_segments, absorb_tiny_clusters)
+import numpy as np
 
 fails = []
 
@@ -69,7 +71,7 @@ subs2 = subtitle_units(units, None, 28)
 check("无对齐=整段一条", len(subs2) == 1 and subs2[0]["start_ms"] == 0, f"got {subs2}")
 # 相邻重叠收敛
 units_ov = [{"start_ms": 0, "end_ms": 3000, "text": "第一句。第二句。", "spk": None}]
-al_ov = [{"tokens": ["第", "一", "句", "第", "二", "句"], "ts": [[0, 1000], [1000, 1200], [1000, 1400], [1300, 1500], [1500, 1700], [1700, 1900]]}]
+al_ov = [{"tokens": ["第", "一", "句", "第", "二", "句"], "ts": [[0, 1000], [1000, 1200], [1200, 1400], [1300, 1500], [1500, 1700], [1700, 1900]]}]
 subs3 = subtitle_units(units_ov, al_ov, 28)
 check("重叠收敛(前条 end<=后条 start)", all(subs3[i]["end_ms"] <= subs3[i + 1]["start_ms"] for i in range(len(subs3) - 1)), f"got {subs3}")
 
@@ -87,6 +89,42 @@ check("时间戳缺失=不可用", aed_ts_usable([{"timestamp": None, "transcrip
 check("数量不符=不可用", aed_ts_usable([{"timestamp": ts8[:2], "transcription": "大家好"}]) is False)
 al = aed_aligns_from([{"timestamp": [("开", 0.1, 0.25), ("放", 0.25, 0.4)], "transcription": "开放"}])
 check("秒->毫秒换算", al[0]["ts"] == [[100, 250], [250, 400]] and al[0]["tokens"] == ["开", "放"], f"got {al}")
+
+print("[8] merge_short_segments 碎段并入邻近段")
+ms1 = merge_short_segments([[0, 2000], [2200, 2500], [5000, 6000]], 400, 500)
+check("碎段并入前段", ms1 == [(0, 2500), (5000, 6000)], f"got {ms1}")
+ms2 = merge_short_segments([[0, 300], [500, 2000]], 400, 500)
+check("首段过短并入次段", ms2 == [(0, 2000)], f"got {ms2}")
+ms3 = merge_short_segments([[0, 2000], [5000, 5300]], 400, 500)
+check("远距碎段保留", ms3 == [(0, 2000), (5000, 5300)], f"got {ms3}")
+check("min_seg=0 关闭", merge_short_segments([[0, 100], [200, 300]], 0, 500) == [(0, 100), (200, 300)])
+
+print("[9] split_long_segments 超长段等分")
+sl1 = split_long_segments([[0, 130000]], 60000)
+check("130s 切 3 段", len(sl1) == 3 and sl1[0][0] == 0 and sl1[-1][1] == 130000, f"got {sl1}")
+check("每段<=60s", all(e - s <= 60001 for s, e in sl1), f"got {sl1}")
+sl2 = split_long_segments([[0, 30000]], 60000)
+check("短段不动", sl2 == [(0, 30000)], f"got {sl2}")
+check("max=0 关闭", split_long_segments([[0, 999999]], 0) == [(0, 999999)])
+
+print("[10] merge_by_speaker 块长上限")
+mb = merge_by_speaker([[0, 12000], [12000, 24000]], [0, 0], 800, max_ms=20000)
+check("超上限强制断块", len(mb) == 2, f"got {mb}")
+mb2 = merge_by_speaker([[0, 8000], [8000, 16000]], [0, 0], 800, max_ms=20000)
+check("未超上限正常合并", len(mb2) == 1, f"got {mb2}")
+mb3 = merge_by_speaker([[0, 12000], [12000, 24000]], [0, 0], 800)
+check("默认上限 60s 不拆", len(mb3) == 1, f"got {mb3}")
+
+print("[11] absorb_tiny_clusters 小簇吸收")
+emb = np.array([[1.0, 0.0], [0.0, 1.0], [0.99, 0.1]])  # 段2 与簇0 最相似
+segs_t = [[0, 10000], [10000, 20000], [20000, 20500]]
+out = absorb_tiny_clusters(emb, np.array([0, 1, 2]), segs_t)
+check("小簇并入最相似大簇", out.tolist() == [0, 1, 0], f"got {out.tolist()}")
+out2 = absorb_tiny_clusters(np.array([[1.0, 0.0], [0.0, 1.0]]), np.array([0, 1]),
+                            [[0, 10000], [10000, 20000]])
+check("全为大簇不吸收", out2.tolist() == [0, 1], f"got {out2.tolist()}")
+out3 = absorb_tiny_clusters(emb, np.array([0, 0, 0]), segs_t)
+check("单簇直接返回", out3.tolist() == [0, 0, 0], f"got {out3.tolist()}")
 
 print()
 if fails:

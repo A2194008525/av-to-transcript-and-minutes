@@ -1,0 +1,39 @@
+# voice-to-minutes 依赖声明
+#
+# 安装（建议在虚拟环境或 conda 环境中）：
+#   pip install -r requirements.txt
+# GPU 加速需先按 https://pytorch.org 指引安装对应 CUDA 版本的 torch。
+
+# --- 语音转写（核心）---
+torch>=2.0                # 需 CUDA 版以获得 GPU 加速（CPU 亦可运行，速度慢）
+torchaudio                # 音频读写（与 torch 版本配套）
+transformers>=4.45        # Qwen3-ASR 模型加载（需支持 Qwen3ASRForConditionalGeneration）
+funasr>=1.1               # VAD 切段 / cam++ 声纹 / ct-punc 标点 / fa-zh 强制对齐
+librosa                   # 音频重采样
+soundfile                 # wav 读写
+numpy
+scikit-learn              # 声纹层次聚类（cam++ 引擎）
+opencc-python-reimplemented  # 繁→简转换（默认启用）
+
+# --- 人声/背景音分离 ---
+demucs>=4.0               # htdemucs 两轨分离（--no-separate 可跳过）
+
+# --- 说话人分离（pyannote 引擎，会议场景推荐）---
+pyannote.audio>=4.0       # community-1 分割模型（重叠语音更准）
+# 注意：pyannote.audio 会引入 torchcodec，而 torchcodec 要求 FFmpeg full-shared 版；
+# 若报 libtorchcodec 加载失败，执行：pip uninstall torchcodec
+# 本项目用 soundfile 预载波形，不依赖 torchcodec。
+
+# --- 文稿排版（article-format 技能，按需）---
+python-docx               # 生成规范 docx
+lxml
+
+# --- 可选：FireRedASR2-AED 备选识别引擎（中/英/粤，短素材用）---
+# 见 qwen_asr.py 头部注释中的模型与代码获取方式
+# pypinyin rapidfuzz      # 专名纠错拼音模糊匹配（--fuzzy）
+
+# --- 系统依赖（非 pip）---
+# FFmpeg（含 ffmpeg / ffprobe，需在 PATH 中）——拆轨、噪声门、字幕合成
+#   Windows: winget install ffmpeg  或 https://www.gyan.dev/ffmpeg/builds/
+#   Linux:   apt install ffmpeg
+#   macOS:   brew install ffmpeg

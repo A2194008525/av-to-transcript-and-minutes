@@ -1,3 +1,42 @@
+# 处理产物与中间文件（勿提交）
+separated_out/
+*_no_audio.*
+完整音轨.*
+人声.wav
+人声_转写用.wav
+背景音.wav
+转写结果*.json
+转写文稿-*
+会议原文-*
+会议纪要-*
+*.srt
+_asr_job.json
+_demucs_tmp/
+_article_base_tmp.docx
+
+# 音频 / 视频素材（本地数据，勿上传）
+*.mp3
+*.m4a
+*.wav
+*.flac
+*.mp4
+*.mkv
+*.mov
+
+# Python
 __pycache__/
 *.pyc
+.venv/
+venv/
+*.egg-info/
 .mimosa/
+
+# 模型缓存
+.cache/
+models/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

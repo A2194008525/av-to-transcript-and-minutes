@@ -11,7 +11,7 @@
 #   解析      processor.decode(ids, return_format="parsed") -> {"language","transcription"}
 #   音频输入  本地路径/URL/numpy，或其列表（批量）；路径模式由 processor 内部读取重采样
 #   模型仓库  Qwen/Qwen3-ASR-1.7B-hf（ModelScope, -hf 后缀 = transformers 原生格式）, 4.08GB
-#   备选引擎  FireRedASR2-AED（ModelScope `xukaituo/FireRedASR2-AED`, 4.73GB; 代码 https://github.com/FireRedTeam/FireRedASR2S）
+#   备选引擎  FireRedASR2-AED（ModelScope `xukaituo/FireRedASR2-AED`, 4.73GB; 代码克隆到 ~/.local/fire-red-asr2s）
 #             FireRedAsr2.from_pretrained("aed", model_dir, cfg).transcribe(uttids, wav_paths)
 #             -> [{'uttid','text','confidence','timestamp':[('字',start_s,end_s),...]}]  (字级时间戳原生)
 #             输入限制: kaldiio.load_mat 只认 16k 单声道 wav（mp3 会报 read_ascii_mat 错）→ 脚本内自动转
@@ -46,6 +46,9 @@ MS_CACHE = Path(os.path.expanduser("~")) / ".cache" / "modelscope" / "models" / 
 AED_MODEL_DIR = Path.home() / ".cache" / "modelscope" / "models" / "xukaituo--FireRedASR2-AED"
 AED_CODE_DIR = Path.home() / ".local" / "fire-red-asr2s"
 FIRERED_VAD_DIR = Path(os.path.expanduser("~")) / ".cache" / "fireredvad" / "FireRedVAD" / "VAD"
+# pyannote 说话人分离（社区版 community-1，ModelScope 镜像含 segmentation/embedding/plda 全套）
+PYANNOTE_DIR = Path.home() / ".cache" / "modelscope" / "models" / \
+    "pyannote--speaker-diarization-community-1" / "snapshots" / "master"
 AUTO_SEGMENT_S = 60  # 超过此时长自动走 VAD 分段批量转写(实测比整段自回归快约 20%,且每段语言独立检测)
 PUNCT = set("，。！？；：、,.!?;:…—～~「」『』“”‘’（）()《》〈〉【】[]\"'· \t\n\r")
 HARD_STOP = "。！？；!?;"
@@ -110,6 +113,13 @@ def transcribe_batch(model, processor, audio_paths, language=None, hotwords=None
     if engine == "aed":
         uttids = [f"u{i}" for i in range(len(audio_paths))]
         results = model.transcribe(uttids, list(audio_paths))
+        # AED 内部异常时会返回空列表或短列表（feat_extractor/beam search 失败均如此），
+        # 必须补齐到与输入等长（缺失项记空文本），否则下游 zip 截断会漏赋字段
+        if len(results) < len(audio_paths):
+            print(f"[warn] AED 返回 {len(results)} 条 / 输入 {len(audio_paths)} 条，"
+                  f"缺失段按空文本补齐", file=sys.stderr)
+            results = list(results) + [{"uttid": u, "text": ""}
+                                       for u in uttids[len(results):]]
         texts = [(r.get("text") or "").strip() for r in results]
         # ct-punc 批量调用(逐段调用实测 111 段多花 17s;批量后降到亚秒级)
         if punc is not None and any(texts):
@@ -324,13 +334,112 @@ def write_srt(subs, path, use_speaker):
     path.write_text("\n".join(blocks), encoding="utf-8")
 
 
-def merge_by_speaker(segments, labels, gap_ms):
-    """相邻同说话人且间隔 <= gap_ms 的段合并;返回 [{"start_ms","end_ms","spk","seg_idx"}]"""
+def merge_short_segments(segments, min_ms, gap_ms):
+    """过短 VAD 段（<min_ms）并入前一段（间隔 <= gap_ms）；首段过短则并入后段。
+    目的：碎段的声纹嵌入不稳定，会被聚类误判成假说话人簇，先并入邻近段再提声纹。"""
+    if min_ms <= 0:
+        return [(int(s), int(e)) for s, e in segments]
+    out = []
+    for s, e in segments:
+        s, e = int(s), int(e)
+        if out and (e - s) < min_ms and s - out[-1][1] <= gap_ms:
+            out[-1][1] = e  # 并入前段尾部
+        else:
+            out.append([s, e])
+    if len(out) >= 2 and (out[0][1] - out[0][0]) < min_ms and out[1][0] - out[0][1] <= gap_ms:
+        out[1][0] = out[0][0]  # 首段过短 -> 并入次段头部
+        out.pop(0)
+    return [(a, b) for a, b in out]
+
+
+def split_long_segments(segments, max_ms):
+    """超长 VAD 段按 max_ms 等分。
+    目的：单次超长自回归转写效率崩塌（实测 7 分钟段 GPU 满负荷 20 分钟未完成），
+    拆成 <=max_ms 的多段走批量转写（实测 33 段全量约 3 分钟）。"""
+    if max_ms <= 0:
+        return [(int(s), int(e)) for s, e in segments]
+    out = []
+    for s, e in segments:
+        s, e = int(s), int(e)
+        n = max(1, -(-(e - s) // max_ms))  # 向上取整
+        step = (e - s) / n
+        for k in range(n):
+            out.append((int(round(s + k * step)), int(round(s + (k + 1) * step))))
+    return out
+
+
+def absorb_tiny_clusters(embeddings, labels, segments, max_cluster_ms=5000):
+    """把总时长过短的小簇并入声纹最相似的大簇（消除碎段形成的假说话人）。
+    背景：数百毫秒级碎段的声纹嵌入不稳定，聚类时易自成簇（实测 23 分钟单人口播
+    被切成 15 个假说话人，其中 13 个是 1-3 秒碎块）。这类簇无法承载真实发言人信息，
+    并入后说话人数回归真实。返回重编号后的 labels（numpy 数组）。"""
+    import numpy as np
+    labels = np.asarray(labels)
+    clusters = sorted(set(labels.tolist()))
+    if len(clusters) < 2:
+        return labels
+    dur = {c: sum(int(e) - int(s) for (s, e), l in zip(segments, labels) if l == c)
+           for c in clusters}
+    big = [c for c in clusters if dur[c] > max_cluster_ms]
+    if not big or len(big) == len(clusters):
+        return labels
+    centers = {c: embeddings[labels == c].mean(axis=0) for c in big}
+    for c in clusters:
+        if c in big:
+            continue
+        centroid = embeddings[labels == c].mean(axis=0)
+        best, best_sim = None, -2.0
+        for bc, center in centers.items():
+            denom = float(np.linalg.norm(centroid) * np.linalg.norm(center)) + 1e-9
+            sim = float(centroid @ center) / denom
+            if sim > best_sim:
+                best, best_sim = bc, sim
+        labels[labels == c] = best
+    remap, out = {}, []
+    for l in labels.tolist():
+        if l not in remap:
+            remap[l] = len(remap)
+        out.append(remap[l])
+    return np.array(out)
+
+
+def run_pyannote(src, device):
+    """pyannote 说话人分离（community-1 全套本地模型）；返回 [(start_ms, end_ms, spk_label), ...]
+    优于 cam++ 聚类之处：分割模型原生处理重叠语音（会议抢话场景），无需后验声纹聚类。
+    注意：用 soundfile 预载波形传入，绕开 torchcodec 的 DLL 依赖。"""
+    if not (PYANNOTE_DIR / "config.yaml").is_file():
+        sys.exit(f"pyannote community-1 模型不存在: {PYANNOTE_DIR}\n"
+                 f"下载: python -c \"from modelscope import snapshot_download; "
+                 f"snapshot_download('pyannote/speaker-diarization-community-1')\"")
+    import soundfile as sf
+    import torch
+    from pyannote.audio import Pipeline
+    pipe = Pipeline.from_pretrained(str(PYANNOTE_DIR))
+    pipe.to(torch.device(device))
+    audio_np, sr = sf.read(str(src))
+    if audio_np.ndim > 1:
+        audio_np = audio_np.mean(axis=1)  # 下混单声道
+    wav = torch.from_numpy(audio_np[None, :]).float()
+    dia = pipe({"waveform": wav, "sample_rate": sr})
+    turns = [(int(turn.start * 1000), int(turn.end * 1000), spk)
+             for turn, _, spk in dia.speaker_diarization.itertracks(yield_label=True)]
+    # 必须显式释放：pyannote 模型驻留显存会与后续 Qwen3-ASR 转写争抢，
+    # 实测不释放时进程在转写阶段无堆栈硬崩溃（16GB 显存不够两者共存）
+    del pipe, wav, dia
+    torch.cuda.empty_cache()
+    return turns
+
+
+def merge_by_speaker(segments, labels, gap_ms, max_ms=60000):
+    """相邻同说话人且间隔 <= gap_ms 的段合并；单块时长超过 max_ms 强制断块（保转写吞吐）
+    返回 [{"start_ms","end_ms","spk","seg_idx"}]"""
     merged = []
     for i, (s, e) in enumerate(segments):
         s, e = int(s), int(e)
         spk = int(labels[i])
-        if merged and merged[-1]["spk"] == spk and s - merged[-1]["end_ms"] <= gap_ms:
+        if (merged and merged[-1]["spk"] == spk
+                and s - merged[-1]["end_ms"] <= gap_ms
+                and e - merged[-1]["start_ms"] <= max_ms):
             merged[-1]["end_ms"] = e
             merged[-1]["seg_idx"].append(i)
         else:
@@ -390,7 +499,14 @@ def main():
     ap.add_argument("--max-line", type=int, default=28, help="单条字幕最大字数(默认28)")
     ap.add_argument("--names", default=None, help="说话人重命名,如 '0=张三,1=李四'")
     ap.add_argument("--merge-gap", type=int, default=800, help="相邻同说话人合并间隔阈值ms(默认800,设0关闭)")
+    ap.add_argument("--min-seg", type=int, default=400,
+                    help="过短语音段并入相邻段的阈值ms(默认400,0=关闭;碎段声纹不稳易造假说话人)")
+    ap.add_argument("--max-unit", type=int, default=60000,
+                    help="发言块时长上限ms,超出强制切分(默认60000,0=关闭;超长块单次自回归转写极慢)")
     ap.add_argument("--vad", choices=["fsmn", "firered"], default="fsmn", help="VAD 后端(默认 fsmn;firered 需已装 fireredvad)")
+    ap.add_argument("--diarize-engine", choices=["campp", "pyannote"], default="campp",
+                    help="说话人分离引擎: campp=VAD+cam++声纹聚类(默认,轻量); "
+                         "pyannote=community-1 分割模型(原生处理重叠语音,会议抢话场景更准; 需已装 pyannote.audio)")
     ap.add_argument("--engine", choices=["qwen", "aed"], default="qwen",
                     help="识别引擎: qwen=Qwen3-ASR-1.7B(默认,多语言含日文); aed=FireRedASR2-AED(中/英/粤更准,不支持日文,输出经 ct-punc 补标点)")
     ap.add_argument("--no-punc", action="store_true", help="aed 引擎不补标点(默认用 ct-punc 补)")
@@ -401,7 +517,21 @@ def main():
     ap.add_argument("--max-new-tokens", type=int, default=2048, help="单段最大生成 token 数")
     ap.add_argument("--no-t2s", action="store_true", help="关闭默认的繁->简转换(保留模型原始输出)")
     ap.add_argument("--device", default="cuda:0", help="推理设备,无 N 卡用 cpu")
+    ap.add_argument("--job-config", default=None,
+                    help="任务配置 JSON 路径（供管线脚本透传参数；与命令行同名参数等价）")
     args = ap.parse_args()
+
+    # 任务配置合并：仅覆盖命令行未显式给出的项（命令行优先）
+    if args.job_config:
+        cfg_path = Path(os.path.realpath(args.job_config))
+        if not cfg_path.is_file():
+            sys.exit(f"任务配置不存在: {cfg_path}")
+        cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+        defaults = {a.dest for a in ap._actions if a.dest != "job_config"}
+        for k, v in cfg.items():
+            if k not in defaults:
+                sys.exit(f"任务配置含未知项: {k}")
+            setattr(args, k, v)
 
     # 输入路径校验:拒绝 ".."，realpath 规范化
     if ".." in args.audio:
@@ -550,56 +680,83 @@ def main():
         return
 
     # ---- 说话人分离模式:分环实现(与技能 diarize.py 同一逻辑,识别引擎换成 Qwen3-ASR) ----
-    from sklearn.cluster import AgglomerativeClustering
-
-    segments = run_vad(src, args.vad, args.device)
-    if not segments:
-        sys.exit("未检测到语音(VAD 结果为空)")
-    log(f"[2] VAD({args.vad}) 切出 {len(segments)} 个语音段 (累计 {time.time()-t0:.0f}s)")
     audio = preloaded_audio if preloaded_audio is not None else librosa.load(src, sr=16000, mono=True)[0]
 
-    from funasr import AutoModel
-    spk = AutoModel(model="cam++", device=args.device, disable_update=True)
-
-    def to_numpy(x):
-        return x.cpu().numpy() if hasattr(x, "cpu") else np.asarray(x)
-
-    embeddings = []
-    for (s_ms, e_ms) in segments:
-        seg = audio[s_ms * 16: e_ms * 16]
-        emb = to_numpy(spk.generate(input=seg, fs=16000)[0]["spk_embedding"]).flatten()
-        embeddings.append(emb / np.linalg.norm(emb))
-    embeddings = np.array(embeddings)
-
-    sim = embeddings @ embeddings.T
-    dist = 1 - sim
-    np.fill_diagonal(dist, 0)
-    if len(segments) >= 2:
-        labels = AgglomerativeClustering(
-            n_clusters=None, distance_threshold=1 - args.threshold,
-            metric="precomputed", linkage="average",
-        ).fit_predict((dist + dist.T) / 2)
-        log(f"[3] 声纹聚类完成: {labels.max()+1} 个说话人 (阈值 {args.threshold})")
-
-        # 簇间相似度边缘提示:帮助发现"同人被拆分"(实测合成音频 5 人聚成 6 簇即此情形)
-        uniq = sorted(set(labels.tolist()))
-        if len(uniq) >= 2:
-            pair_sims = []
-            for i in range(len(uniq)):
-                for j in range(i + 1, len(uniq)):
-                    a, b = embeddings[labels == uniq[i]], embeddings[labels == uniq[j]]
-                    pair_sims.append((float((a @ b.T).mean()), uniq[i], uniq[j]))
-            pair_sims.sort(reverse=True)
-            top_sim, spk_a, spk_b = pair_sims[0]
-            if top_sim >= args.threshold - 0.08:
-                log(f"提示: 说话人{spk_a}与说话人{spk_b}声纹相似度 {top_sim:.2f}, 接近阈值 {args.threshold}; "
-                    f"若实为同一人可试 --threshold {max(0.5, args.threshold - 0.05):.2f}")
+    if args.diarize_engine == "pyannote":
+        # pyannote 路径：分割模型原生给出「片段+说话人」，跳过 VAD/声纹聚类链
+        turns = run_pyannote(src, args.device)
+        if not turns:
+            sys.exit("pyannote 未检测到语音")
+        spk_ids, segments, labels = {}, [], []
+        for s, e, spk in turns:
+            if spk not in spk_ids:
+                spk_ids[spk] = len(spk_ids)
+            for ps, pe in split_long_segments([(s, e)], args.max_unit):  # 超长片段切分保转写吞吐
+                segments.append((ps, pe))
+                labels.append(spk_ids[spk])
+        labels = np.array(labels)
+        log(f"[2] pyannote 分离: {len(turns)} 个片段 -> {len(spk_ids)} 个说话人"
+            + (f"（超长切分后 {len(segments)} 段）" if len(segments) != len(turns) else "")
+            + f" (累计 {time.time()-t0:.0f}s)")
     else:
-        labels = np.zeros(len(segments), dtype=int)
-        log("[3] 语音段不足 2 段,跳过聚类(视为单一说话人)")
+        from sklearn.cluster import AgglomerativeClustering
+
+        segments = run_vad(src, args.vad, args.device)
+        if not segments:
+            sys.exit("未检测到语音(VAD 结果为空)")
+        n_raw = len(segments)
+        segments = merge_short_segments(segments, args.min_seg, 500)   # 碎段先并入邻近段
+        segments = split_long_segments(segments, args.max_unit)        # 超长段强制切分
+        log(f"[2] VAD({args.vad}) 切出 {n_raw} 个语音段"
+            + (f" -> 碎段合并/超长切分后 {len(segments)} 段" if len(segments) != n_raw else "")
+            + f" (累计 {time.time()-t0:.0f}s)")
+
+        from funasr import AutoModel
+        spk = AutoModel(model="cam++", device=args.device, disable_update=True)
+
+        def to_numpy(x):
+            return x.cpu().numpy() if hasattr(x, "cpu") else np.asarray(x)
+
+        embeddings = []
+        for (s_ms, e_ms) in segments:
+            seg = audio[s_ms * 16: e_ms * 16]
+            emb = to_numpy(spk.generate(input=seg, fs=16000)[0]["spk_embedding"]).flatten()
+            embeddings.append(emb / np.linalg.norm(emb))
+        embeddings = np.array(embeddings)
+
+        sim = embeddings @ embeddings.T
+        dist = 1 - sim
+        np.fill_diagonal(dist, 0)
+        if len(segments) >= 2:
+            labels = AgglomerativeClustering(
+                n_clusters=None, distance_threshold=1 - args.threshold,
+                metric="precomputed", linkage="average",
+            ).fit_predict((dist + dist.T) / 2)
+            n_raw_spk = len(set(labels.tolist()))
+            labels = absorb_tiny_clusters(embeddings, labels, segments)
+            n_spk = len(set(labels.tolist()))
+            log(f"[3] 声纹聚类完成: {n_spk} 个说话人 (阈值 {args.threshold})"
+                + (f"；小簇吸收 {n_raw_spk} -> {n_spk}（碎段簇并入最相似大簇）" if n_spk < n_raw_spk else ""))
+
+            # 簇间相似度边缘提示:帮助发现"同人被拆分"(实测合成音频 5 人聚成 6 簇即此情形)
+            uniq = sorted(set(labels.tolist()))
+            if len(uniq) >= 2:
+                pair_sims = []
+                for i in range(len(uniq)):
+                    for j in range(i + 1, len(uniq)):
+                        a, b = embeddings[labels == uniq[i]], embeddings[labels == uniq[j]]
+                        pair_sims.append((float((a @ b.T).mean()), uniq[i], uniq[j]))
+                pair_sims.sort(reverse=True)
+                top_sim, spk_a, spk_b = pair_sims[0]
+                if top_sim >= args.threshold - 0.08:
+                    log(f"提示: 说话人{spk_a}与说话人{spk_b}声纹相似度 {top_sim:.2f}, 接近阈值 {args.threshold}; "
+                        f"若实为同一人可试 --threshold {max(0.5, args.threshold - 0.05):.2f}")
+        else:
+            labels = np.zeros(len(segments), dtype=int)
+            log("[3] 语音段不足 2 段,跳过聚类(视为单一说话人)")
 
     # 合并相邻同说话人碎段(预设 800ms,纪要可读性)
-    units = merge_by_speaker(segments, labels, args.merge_gap)
+    units = merge_by_speaker(segments, labels, args.merge_gap, args.max_unit)
     if args.merge_gap > 0 and len(units) < len(segments):
         log(f"[4] 碎段合并: {len(segments)} 段 -> {len(units)} 个发言块 (间隔阈值 {args.merge_gap}ms)")
     else:
@@ -609,6 +766,11 @@ def main():
     unit_files = write_unit_wavs(audio, units, tmp_dir)
 
     parsed = infer(unit_files)
+    if len(parsed) != len(units):  # 防御：任何引擎返回短列表都不能让 zip 静默截断
+        print(f"[warn] 识别结果 {len(parsed)} 条 / 输入 {len(units)} 条，缺失段按空文本补齐",
+              file=sys.stderr)
+        parsed = list(parsed) + [{"transcription": ""}
+                                 for _ in range(len(units) - len(parsed))]
     for u, p in zip(units, parsed):
         u["text"] = p["transcription"]
         u["language"] = p.get("language")

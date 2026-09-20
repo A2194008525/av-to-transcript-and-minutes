@@ -1,134 +1,188 @@
 # 语音转会议纪要（voice-to-minutes）
 
-一套**完全离线、本地运行**的「录音 → 转写 → 会议纪要」全流程工具箱，由两个 AI Agent 技能（Agent Skills / SKILL.md 规范）组成：
+一套**完全离线、本地运行**的「音视频 → 转写文稿 / 会议纪要」全流程工具箱：
 
 ```
-会议录音 (.m4a/.mp3/.wav/...)
+视频 / 音频（mp4/mkv/mp3/m4a/wav/…）
         │
-        ▼
-┌─────────────────────────────┐
-│  funasr-transcribe 语音转写   │  Qwen3-ASR-1.7B + FunASR
-│  · 说话人分离（谁在何时说了什么）│  · 字幕 SRT（字级时间戳）
-│  · 专名纠错 · 降噪 · 情绪分析  │  · GPU 加速，无需 API 密钥
-└─────────────────────────────┘
-        │  转写稿（含说话人标签的文本）
-        ▼
-┌─────────────────────────────┐
-│  meeting-notes-expert 纪要整理 │  五段式结构化纪要
-│  · 议题去重：一个议题只说一次   │  · 决策标注状态与依据
-│  · 待办七列表（含验收标准）    │  · 公文排版规范可直接交付
-└─────────────────────────────┘
+        ├─ ① 拆轨（视频输入）        无声视频 + 完整音轨（无损，FFmpeg）
         │
-        ▼
-   结构化会议纪要（Markdown / 公文格式）
+        ├─ ② 人声 / 背景音分离        人声.wav + 背景音.wav（Demucs htdemucs，GPU）
+        │
+        ├─ ③ 噪声门清理              人声_转写用.wav（消除分离模型的静音伪影，保 VAD 可用）
+        │
+        ├─ ④ 说话人分离 + 转写        Qwen3-ASR-1.7B × (pyannote / cam++)，带时间戳与说话人
+        │
+        └─ ⑤ 组稿 + 排版规范 docx    转写文稿（普通）  或  会议原文（带标签，供提炼纪要）
+                                     正式纪要由 AI Agent 按 meeting-notes-expert 模板提炼
 ```
 
-> 当前版本：v1.0 ｜ License: [MIT](LICENSE) ｜ 平台：ZCode / Claude Code 及其他支持 SKILL.md 规范的 AI Agent
+**一条命令跑完 ①→⑤**：
+
+```bash
+python voice_to_minutes.py <视频/音频文件或文件夹> [-o 输出目录] [--meeting] [--srt] …
+```
+
+> 当前版本：**v2.0** ｜ License: [MIT](LICENSE) ｜ 环境：Windows / Linux / macOS，需 FFmpeg 与 Python 3.10+
 
 ---
 
-## ✨ 为什么是这套组合
+## ✨ 特性
 
-- **完全离线**：语音识别、声纹聚类、纪要生成全程本地，录音不出机器——会议内容敏感场景可用；无任何 API 密钥。
-- **实测踩坑沉淀**：两个技能内嵌 21 条实测踩坑记录（聚类阈值调法、引擎选型对照、PyPI 镜像、显存要求……），不是纸上谈兵。
-- **双引擎可切换**：Qwen3-ASR（多语言含日文）/ FireRedASR2-AED（中英粤更准），一条参数切换。
-- **从原始录音到可执行纪要**：转写稿自动带说话人标签与时间戳，纪要环节按议题聚合去重，待办带责任人与验收标准。
+- **完全离线**：模型全部本地运行，无 API 密钥、无网络依赖（首次运行自动下载模型后）
+- **一条命令全自动**：拆轨 → 分离 → 说话人分离 → 转写 → 排版成 docx
+- **双产出模式**：`转写文稿-<名>.docx`（普通音视频）／`会议原文-<名>.docx`（会议，带 `[分:秒] 说话人N：` 标签）
+- **说话人分离双引擎**：
+  - `pyannote`（community-1，会议场景默认）——分割模型原生处理**重叠语音**，实测真实 28 分钟会议从 35 个假说话人收敛到 2 个
+  - `campp`（VAD + cam++ 声纹聚类）——轻量，单人/访谈素材够用
+- **字幕与纠错**：`--srt` 出字级时间戳字幕；`--hotwords` 热词偏置；`--names` 说话人真名映射
+- **断点续跑**：转写（最贵环节）结果按参数指纹缓存，中断重跑自动跳过
+- **批量处理**：输入文件夹时递归处理其中所有音视频
 
-## 📦 仓库结构
+---
+
+## 🚀 快速开始
+
+### 1. 环境准备
+
+```bash
+# 系统依赖：FFmpeg（须在 PATH 中）
+winget install ffmpeg            # Windows
+# apt install ffmpeg            # Linux
+# brew install ffmpeg           # macOS
+
+# Python 依赖
+pip install -r requirements.txt
+# GPU 加速：先按 https://pytorch.org 安装对应 CUDA 版本的 torch
+
+# 若报 libtorchcodec 加载失败（pyannote 引入的库与静态 FFmpeg 不兼容）：
+pip uninstall torchcodec
+```
+
+### 2. 模型准备（首次，自动下载）
+
+| 用途 | 模型 | 来源 |
+| --- | --- | --- |
+| 转写识别 | Qwen3-ASR-1.7B | ModelScope `Qwen/Qwen3-ASR-1.7B-hf` |
+| 说话人分离（会议） | pyannote community-1 | ModelScope `pyannote/speaker-diarization-community-1` |
+| 说话人分离（轻量） | fsmn-vad + cam++ | 随 FunASR 自动下载 |
+| 人声分离 | htdemucs | 随 Demucs 自动下载 |
+
+> pyannote 官方模型在 HuggingFace 为门控资源（需申请权限）；**ModelScope 有官方镜像且无需门控**，推荐：
+> ```bash
+> python -c "from modelscope import snapshot_download; snapshot_download('pyannote/speaker-diarization-community-1')"
+> ```
+
+### 3. 跑起来
+
+```bash
+# 普通音视频 → 转写文稿（自动说话人分离）
+python voice_to_minutes.py 我的视频.mp4
+
+# 会议录音 → 会议原文（带时间戳与说话人标签，供后续提炼纪要）
+python voice_to_minutes.py 会议录音.m4a --meeting
+
+# 批量 + 字幕 + 人名映射 + 热词
+python voice_to_minutes.py ./素材目录 --meeting --srt \
+    --names "0=张三,1=李四" --hotwords "产品名,行业术语"
+```
+
+### 4. 常用参数
+
+| 参数 | 说明 |
+| --- | --- |
+| `--meeting` | 产出会议原文（带时间戳+说话人标签）而非普通转写文稿 |
+| `--srt` | 额外产出 `.srt` 字幕（字级时间戳） |
+| `--diarize-engine auto\|pyannote\|campp` | 说话人分离引擎（`auto`=会议用 pyannote，其余 campp） |
+| `--names "0=张三,1=李四"` | 说话人真名映射 |
+| `--hotwords "词1,词2"` | 热词偏置，提升专名识别率 |
+| `--no-separate` | 跳过人声分离（纯人声音频可直接转写） |
+| `--no-asr` | 只做拆轨/分离，不转写 |
+| `--force` | 重跑已处理过的素材 |
+| `-o 输出目录` | 指定输出目录（默认输入旁 `separated_out/`） |
+
+---
+
+## 📦 产物说明
+
+每个输入在输出目录下生成同名子目录：
+
+| 文件 | 说明 |
+| --- | --- |
+| `无声视频.mp4` | 去掉声音的视频（仅视频输入，画面无损） |
+| `完整音轨.m4a` | 从视频无损提取的完整音频（仅视频输入） |
+| `人声.wav` / `背景音.wav` | Demucs 分离出的人声与背景音 |
+| `人声_转写用.wav` | 经噪声门清理后供转写的版本（可复现中间件） |
+| `转写结果*.json` | 结构化转写结果（说话人分段/文本/时间戳），按参数指纹缓存 |
+| `转写文稿-<名>.md/.docx` | 普通模式成稿（如有 article-format 技能则套用排版规范） |
+| `会议原文-<名>.md/.docx` | 会议模式成稿（`[00:00] 说话人N：文本`） |
+| `会议原文-<名>.srt` | 字幕（`--srt`，含说话人标记） |
+
+**会议纪要**由 AI Agent 读取「会议原文」后按 [meeting-notes-expert](skills/meeting-notes-expert/SKILL.md) 模板提炼成五段式纪要（基本信息 / 会议内容 / 核心要点 / 会议总结 / 待办事项表）——这一步是理解性工作，交给会话内的 AI 完成，产出 `会议纪要-<名>.docx`。
+
+---
+
+## 🧩 项目结构
 
 ```
 voice-to-minutes/
-├── README.md            ← 本文件（全流程总览）
-├── LICENSE              ← MIT
-└── skills/
-    ├── funasr-transcribe/        ← 技能一：本地语音转写
-    │   ├── SKILL.md              ← 技能定义（安装时只需要这个目录）
-    │   ├── references/
-    │   │   └── advanced.md       ← 模型清单/环境安装/21 条踩坑记录
-    │   └── scripts/
-    │       ├── qwen_asr.py       ← 主力脚本（双引擎/分离/字幕/纠错）
-    │       ├── transcribe.py     ← FunASR 原生通道（备选）
-    │       ├── diarize.py        ← 旧版分离脚本（保留）
-    │       └── test_qwen_asr_units.py  ← 纯函数单元自测
-    └── meeting-notes-expert/
-        └── SKILL.md              ← 技能二：会议纪要整理
+├── voice_to_minutes.py              # 全自动链路主脚本（①→⑤）
+├── test_pipeline_e2e.py             # 端到端回归（自动合成素材，18 项断言）
+├── requirements.txt
+├── skills/
+│   ├── funasr-transcribe/
+│   │   ├── SKILL.md                 # 转写技能（Agent 调用规范）
+│   │   └── scripts/
+│   │       ├── qwen_asr.py          # 转写引擎：Qwen3-ASR + pyannote/cam++ + 字幕/纠错
+│   │       ├── transcribe.py        # 简化入口
+│   │       ├── diarize.py           # 说话人分离（FunASR 路线）
+│   │       └── test_qwen_asr_units.py  # 引擎单元测试
+│   └── meeting-notes-expert/
+│       └── SKILL.md                 # 纪要整理技能（五段式模板）
+└── LICENSE
 ```
 
-## 🚀 安装
+---
 
-### 1）环境准备（转写技能需要，一次性）
-
-- Python 3.10+，NVIDIA 显卡（RTX 50 系必须 cu128+ 的 torch；无 N 卡可用 `--device cpu`，速度慢）
+## ✅ 验证
 
 ```bash
-pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu130
-pip install funasr modelscope -i https://pypi.tuna.tsinghua.edu.cn/simple
+# 端到端回归（自动合成 TTS 测试素材，断言全链路产物）
+python test_pipeline_e2e.py
+
+# 引擎单元测试（切句/时间戳/碎段合并/超长切分/小簇吸收等纯逻辑）
+python skills/funasr-transcribe/scripts/test_qwen_asr_units.py
 ```
 
-模型首次运行自动下载（主力 Qwen3-ASR-1.7B 约 4.1GB），缓存在 `~/.cache/modelscope/models/`。
+实测性能参考（RTX 5070 Ti 16GB，28 分钟中文会议）：
 
-### 2）安装两个技能
-
-```bash
-git clone https://github.com/A2194008525/voice-to-minutes.git
-```
-
-把 `skills/` 下两个文件夹整体拷入你的 Agent 技能目录：
-
-| 平台 | 技能目录 |
+| 环节 | 耗时 |
 | --- | --- |
-| ZCode | `~/.zcode/skills/` |
-| Claude Code | `~/.claude/skills/` |
+| 人声分离（Demucs） | ~1 分钟 |
+| 说话人分离（pyannote） | ~40 秒 |
+| 转写（Qwen3-ASR） | ~87 秒 |
+| **全流程** | **约 4 分钟** |
 
-### 3）自检
+---
 
-```bash
-python skills/funasr-transcribe/scripts/test_qwen_asr_units.py   # 应输出 ALL PASS
-python -c "import funasr, torch; print(funasr.__version__, torch.cuda.is_available())"
-```
+## 🔧 技术要点与已知限制
 
-## 💬 使用
+**关键设计**
 
-装好后对 Agent 说人话即可，两条命令走完全流程：
+- **噪声门（必需）**：Demucs 在静音段输出低电平伪影，会让下游 VAD 失效（整段连成一块、说话人分离报废）。链路在分离与转写之间插入 `agate` 噪声门恢复段间真静音。
+- **三层声纹防护**（cam++ 引擎）：碎段合并（<400ms）→ 超长段切分（>60s，保批量转写吞吐）→ 小簇吸收（<5s 的碎簇并入最相似大簇）。
+- **pyannote 优先**：实测真实会议抢话交叠场景，pyannote 分离质量显著优于声纹聚类路线。
+- **torchcodec 规避**：pyannote 引入的 torchcodec 与静态 FFmpeg 不兼容；链路用 soundfile 预载波形绕过，建议 `pip uninstall torchcodec`。
 
-```text
-第 1 步：把这段会议录音转写一下，要区分说话人 → audio/20260918周会.m4a
-第 2 步：把转写稿整理成会议纪要 → 20260918周会_transcript 的内容
-```
+**已知限制**
 
-也可以直接给单个技能派活：
+- 会议**抢话极严重**时说话人分离仍可能过切（实测 35 簇 → 2 簇已大幅改善，但不保证 100% 准确）
+- 说话人编号在不同次运行间可能互换（可用 `--names` 固定映射）
+- FireRedASR2-AED 备选引擎在长音频上性能差（实测 28 分钟素材慢 44 倍），仅建议短素材使用
+- 输出 docx 的排版规范依赖 `article-format` 技能（未安装时产出标准 docx，无规范排版）
 
-| 场景 | 示例指令 |
-| --- | --- |
-| 只要转写 | `python skills/funasr-transcribe/scripts/qwen_asr.py 会议录音.m4a --diarize --srt` |
-| 只要纪要 | 「把这段会议记录整理成纪要」（直接给文本） |
-| 字幕制作 | 「给这个视频的录音出一份 SRT 字幕」 |
+---
 
-> 转写完成后输出的文本（stdout 或 `.json`）直接交给 meeting-notes-expert 即可；两个技能也可独立使用。
+## 📄 License
 
-## 📋 两个技能各自的能力
-
-### funasr-transcribe（语音 → 文字）
-
-整段转写、说话人分离（VAD 切段 → CAM++ 声纹 → 余弦层次聚类的手动分环实现）、SRT 字幕（fa-zh 强制对齐出字级时间戳）、专名确定性纠错（`--replace`）、拼音模糊纠错（`--fuzzy`）、可选降噪（ZipEnhancer）、录音情绪分析（emotion2vec）、繁转简。引擎选型与参数详见 [skills/funasr-transcribe/SKILL.md](skills/funasr-transcribe/SKILL.md)。
-
-### meeting-notes-expert（文字 → 纪要）
-
-五段式纪要（基本信息 / 会议内容 / 核心要点 / 会议总结 / 待办表格）；「一个议题只说一次」去重红线；关键决策标注状态（已定/待定/待确认）与可溯源依据；待办七列表（含验收标准），按优先级→时间排序；遵循全局文章排版规范（黑体标题/宋体正文/Word 自动编号/导航目录）。详见 [skills/meeting-notes-expert/SKILL.md](skills/meeting-notes-expert/SKILL.md)。
-
-## ⚠️ 已知限制
-
-- 说话人分离依赖声纹聚类，**说话人编号 ≠ 真实身份**（按出现顺序分配），交付前需人工听一段确认，再用 `--names` 固定。
-- FireRedASR2-AED 引擎不支持日文；中日混合场景用默认 Qwen 引擎。
-- 降噪（`--denoise`）是条件性收益：实测对白噪声无改善甚至更差，仅真实 BGM/强噪素材建议试用。
-- 首次运行需下载模型（主力约 4.1GB），请保持网络可用；之后完全离线。
-
-## 🙏 致谢
-
-- [Qwen3-ASR](https://modelscope.cn/models/Qwen/Qwen3-ASR-1.7B-hf) 与 [FunASR](https://github.com/modelscope/FunASR)（阿里达摩院）——识别与 VAD/声纹/对齐基座
-- [FireRedASR2](https://github.com/FireRedTeam/FireRedASR2S)（小红书）——可选高准确率引擎
-- [mohui233/meeting-minutes](https://github.com/mohui233/meeting-minutes)——纪要技能 v1.1 合入的三点写作纪律参考
-
-## 📄 许可
-
-本项目采用 [MIT License](LICENSE) 开源：可自由使用、修改、再分发（含商用），只需保留原版权与许可声明；软件按「现状」提供，不含任何担保。所依赖的模型各自遵循其上游许可。
+[MIT](LICENSE)
