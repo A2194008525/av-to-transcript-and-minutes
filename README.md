@@ -1,4 +1,4 @@
-# 语音转会议纪要（voice-to-minutes）
+# 音视频 → 转写文稿 / 会议纪要（av-to-transcript-and-minutes）
 
 一套**完全离线、本地运行**的「音视频 → 转写文稿 / 会议纪要」全流程工具箱：
 
@@ -20,7 +20,7 @@
 **一条命令跑完 ①→⑤**：
 
 ```bash
-python voice_to_minutes.py <视频/音频文件或文件夹> [-o 输出目录] [--meeting] [--srt] …
+python av_to_transcript_and_minutes.py <视频/音频文件或文件夹> [-o 输出目录] [--meeting] [--srt] …
 ```
 
 > 当前版本：**v2.0** ｜ License: [MIT](LICENSE) ｜ 环境：Windows / Linux / macOS，需 FFmpeg 与 Python 3.10+
@@ -77,13 +77,13 @@ pip uninstall torchcodec
 
 ```bash
 # 普通音视频 → 转写文稿（自动说话人分离）
-python voice_to_minutes.py 我的视频.mp4
+python av_to_transcript_and_minutes.py 我的视频.mp4
 
 # 会议录音 → 会议原文（带时间戳与说话人标签，供后续提炼纪要）
-python voice_to_minutes.py 会议录音.m4a --meeting
+python av_to_transcript_and_minutes.py 会议录音.m4a --meeting
 
 # 批量 + 字幕 + 人名映射 + 热词
-python voice_to_minutes.py ./素材目录 --meeting --srt \
+python av_to_transcript_and_minutes.py ./素材目录 --meeting --srt \
     --names "0=张三,1=李四" --hotwords "产品名,行业术语"
 ```
 
@@ -125,8 +125,8 @@ python voice_to_minutes.py ./素材目录 --meeting --srt \
 ## 🧩 项目结构
 
 ```
-voice-to-minutes/
-├── voice_to_minutes.py              # 全自动链路主脚本（①→⑤）
+av-to-transcript-and-minutes/
+├── av_to_transcript_and_minutes.py  # 全自动链路主脚本（①→⑤）
 ├── test_pipeline_e2e.py             # 端到端回归（自动合成素材，18 项断言）
 ├── requirements.txt
 ├── skills/

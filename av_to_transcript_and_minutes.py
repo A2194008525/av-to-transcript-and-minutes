@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""视频/音频处理全自动批量工具（拆轨 + Demucs 人声分离 + 说话人分离转写 + 文章/纪要排版）
+"""音视频 → 转写文稿 / 会议纪要 全自动批量工具（拆轨 + Demucs 人声分离 + 说话人分离转写 + 规范 docx 排版）
 
 流程（视频与音频通用；转写恒走说话人分离）：
   视频 → 无声视频 + 完整音轨（均无损 copy）；音频输入跳过本环（源即完整音频）
@@ -19,7 +19,7 @@
   会议原文-<名>.md / .docx      会议原文（--meeting；正式纪要由 AI 从原文提炼为「会议纪要-<名>」）
 
 用法：
-  python separate_video_audio.py <视频/音频文件或文件夹> [-o 输出目录] [--force] [--no-asr] [--meeting]
+  python av_to_transcript_and_minutes.py <视频/音频文件或文件夹> [-o 输出目录] [--force] [--no-asr] [--meeting]
 """
 import argparse
 import hashlib
@@ -269,7 +269,7 @@ def separate_one(media: Path, out_dir: Path, force: bool, do_asr: bool = True,
 def main():
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    ap = argparse.ArgumentParser(description="视频/音频处理全自动批量（拆轨+人声分离+说话人分离转写+文章/纪要）")
+    ap = argparse.ArgumentParser(description="音视频全自动批量（拆轨 + 人声分离 + 说话人分离转写 → 转写文稿 / 会议纪要）")
     ap.add_argument("input", help="视频/音频文件或包含它们的文件夹")
     ap.add_argument("-o", "--output", help="输出目录（默认 <输入>/separated_out）")
     ap.add_argument("--force", action="store_true", help="已处理过的也重跑")

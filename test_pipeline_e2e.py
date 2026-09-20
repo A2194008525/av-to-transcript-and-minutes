@@ -3,7 +3,7 @@
 """端到端回归脚本：一条命令跑完整链路 + 断言产物齐全。
 
 运行: python scripts/test_pipeline_e2e.py
-原理：自动合成 6 秒测试视频（纯色画面 + TTS 中文语音），跑 separate_video_audio.py
+原理：自动合成 6 秒测试视频（纯色画面 + TTS 中文语音），跑 av_to_transcript_and_minutes.py
       完整链路，断言各类产物存在且非空，最后清理现场。
 覆盖：拆轨（无声视频/完整音轨）、人声分离、噪声门、说话人分离转写、文稿排版成 docx。
 不改动任何既有产物：全部操作在系统临时目录中进行。
@@ -18,12 +18,12 @@ SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
 
 
 def _find_pipeline() -> pathlib.Path:
-    """自动定位链路主脚本（兼容发布版名与本机工作名）"""
-    for name in ("voice_to_minutes.py", "separate_video_audio.py"):
+    """自动定位链路主脚本（兼容本机工作名）"""
+    for name in ("av_to_transcript_and_minutes.py", "separate_video_audio.py"):
         p = SCRIPT_DIR / name
         if p.is_file():
             return p
-    sys.exit("找不到链路主脚本（voice_to_minutes.py / separate_video_audio.py）")
+    sys.exit("找不到链路主脚本（av_to_transcript_and_minutes.py / separate_video_audio.py）")
 
 
 PIPELINE = _find_pipeline()

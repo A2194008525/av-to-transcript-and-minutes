@@ -1,4 +1,4 @@
-# voice-to-minutes 依赖声明
+# av-to-transcript-and-minutes 依赖声明
 #
 # 安装（建议在虚拟环境或 conda 环境中）：
 #   pip install -r requirements.txt
