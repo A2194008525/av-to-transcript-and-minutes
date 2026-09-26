@@ -28,7 +28,7 @@ pyannote.audio>=4.0       # community-1 分割模型（重叠语音更准）
 python-docx               # 生成规范 docx
 lxml
 
-# --- 可选：FireRedASR2-AED 备选识别引擎（中/英/粤，短素材用）---
+# --- 可选：FireRedASR2-AED 备选识别引擎（中/英/粤；v2.1 起长音频显存与速度已优化）---
 # 见 qwen_asr.py 头部注释中的模型与代码获取方式
 # pypinyin rapidfuzz      # 专名纠错拼音模糊匹配（--fuzzy）
 
