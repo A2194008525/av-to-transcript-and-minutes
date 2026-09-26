@@ -23,7 +23,7 @@
 python av_to_transcript_and_minutes.py <视频/音频文件或文件夹> [-o 输出目录] [--meeting] [--srt] …
 ```
 
-> 当前版本：**v2.0** ｜ License: [MIT](LICENSE) ｜ 环境：Windows / Linux / macOS，需 FFmpeg 与 Python 3.10+
+> 当前版本：**v2.1** ｜ License: [MIT](LICENSE) ｜ 环境：Windows / Linux / macOS，需 FFmpeg 与 Python 3.10+
 
 ---
 
@@ -173,12 +173,13 @@ python skills/funasr-transcribe/scripts/test_qwen_asr_units.py
 - **三层声纹防护**（cam++ 引擎）：碎段合并（<400ms）→ 超长段切分（>60s，保批量转写吞吐）→ 小簇吸收（<5s 的碎簇并入最相似大簇）。
 - **pyannote 优先**：实测真实会议抢话交叠场景，pyannote 分离质量显著优于声纹聚类路线。
 - **torchcodec 规避**：pyannote 引入的 torchcodec 与静态 FFmpeg 不兼容；链路用 soundfile 预载波形绕过，建议 `pip uninstall torchcodec`。
+- **AED 显存三层防护**（v2.1）：FireRedASR2-AED 引擎经 `firered_mem_patch.py` 分块注意力（softmax 按行独立，数学等价）+ 时长感知分批（`AED_BATCH_BUDGET_S`）+ OOM 拆批/静音点二分兜底，再配 bf16（`use_half=True`）与 decoder 三角 mask 缓存；实测 4×107s 批量峰值显存 11.8GB → 3.5GB、推理提速 3 倍（不改官方源码，monkey-patch 可还原）。
 
 **已知限制**
 
 - 会议**抢话极严重**时说话人分离仍可能过切（实测 35 簇 → 2 簇已大幅改善，但不保证 100% 准确）
 - 说话人编号在不同次运行间可能互换（可用 `--names` 固定映射）
-- FireRedASR2-AED 备选引擎在长音频上性能差（实测 28 分钟素材慢 44 倍），仅建议短素材使用
+- FireRedASR2-AED 为可选备选引擎，需另行下载模型与代码（v2.1 起长音频已优化，见上）
 - 输出 docx 的排版规范依赖 `article-format` 技能（未安装时产出标准 docx，无规范排版）
 
 ---

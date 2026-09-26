@@ -24,6 +24,15 @@
 #   专名纠错  funasr.utils.postprocess_hotwords.build_postprocess_hotword_matcher
 #             确定性 dict{错:对} 替换；--fuzzy 走拼音模糊（需 pypinyin+rapidfuzz）
 #   VAD 选择  fsmn-vad（默认，随 funasr）/ fireredvad（pip 包 + xukaituo/FireRedVAD 缓存）
+#   显存优化  ① firered_mem_patch.apply(): 分块注意力 monkey-patch（不改 clone 源码，softmax
+#             按行独立故与整块计算严格等价；编码器 ac/bd 就地累加+及时 del）
+#             ② AED 批量改时长感知（aed_batch_plan: 段数≤--batch-size 且批内总时长
+#             ≤AED_BATCH_BUDGET_S），替代固定 8 段一批——60s 段×8 是注意力显存峰值主因
+#             ③ FireRed transcribe 内部吞掉一切异常（asr.py:118-133），OOM 表现=整批
+#             空文本而非抛错 → aed_transcribe_oom_safe 以空结果为重试信号：批拆单 →
+#             单段静音点二分递归（split_wav_at_quiet），文本拼接+时间戳平移合并
+#             ④ use_half=True 走 bf16（Blackwell 张量核，权重/激活减半；配套在 firered_mem_patch：
+#             decoder 三角 mask 按 (size,device) 缓存、forced_align 前 enc_outputs cast fp32）
 #
 # 路径安全边界: 输入拒绝 ".." 且 realpath 规范化；输出 JSON/SRT 锁定音频同目录；
 #               临时分段 wav 锁定系统临时目录；落盘前均显式校验目录边界。
@@ -50,6 +59,9 @@ FIRERED_VAD_DIR = Path(os.path.expanduser("~")) / ".cache" / "fireredvad" / "Fir
 PYANNOTE_DIR = Path.home() / ".cache" / "modelscope" / "models" / \
     "pyannote--speaker-diarization-community-1" / "snapshots" / "master"
 AUTO_SEGMENT_S = 60  # 超过此时长自动走 VAD 分段批量转写(实测比整段自回归快约 20%,且每段语言独立检测)
+AED_BATCH_BUDGET_S = 240  # AED 单次前向的批内总音频时长预算(bf16 后显存余量足,120→240 换吞吐)
+AED_MIN_SPLIT_S = 10.0    # OOM 兜底重试时单段最短时长,短于此不再二分
+AED_MAX_SPLIT_DEPTH = 2   # OOM 兜底二分深度上限(2 → 最小拆到原段 1/4)
 PUNCT = set("，。！？；：、,.!?;:…—～~「」『』“”‘’（）()《》〈〉【】[]\"'· \t\n\r")
 HARD_STOP = "。！？；!?;"
 SOFT_STOP = "，,、：:"
@@ -85,13 +97,15 @@ def load_aed_model(device):
     if str(AED_CODE_DIR) not in sys.path:
         sys.path.insert(0, str(AED_CODE_DIR))
     from fireredasr2s.fireredasr2 import FireRedAsr2, FireRedAsr2Config
+    import firered_mem_patch
     t0 = time.time()
     cfg = FireRedAsr2Config(
-        use_gpu=str(device).startswith("cuda"), use_half=False, beam_size=3, nbest=1,
+        use_gpu=str(device).startswith("cuda"), use_half=True, beam_size=3, nbest=1,
         decode_max_len=0, softmax_smoothing=1.25, aed_length_penalty=0.6, eos_penalty=1.0,
         return_timestamp=True,
     )
     model = FireRedAsr2.from_pretrained("aed", str(AED_MODEL_DIR), cfg)
+    print(f"[info] {firered_mem_patch.apply()}", file=sys.stderr)
     return model, None, time.time() - t0
 
 
@@ -106,13 +120,17 @@ def load_punc(device):
 
 
 def transcribe_batch(model, processor, audio_paths, language=None, hotwords=None, max_new_tokens=2048,
-                     t2s=None, matcher=None, punc=None, engine="qwen"):
+                     t2s=None, matcher=None, punc=None, engine="qwen", aed_ctx=None):
     """批量转写,返回 [{"language","transcription"}, ...]
     Qwen 引擎: 支持 language/hotwords 偏置、自带标点与语言识别
-    AED 引擎: 忽略 language/hotwords（模型无此接口）；输出无标点,经 ct-punc 补；时间戳由 AED 原生提供"""
+    AED 引擎: 忽略 language/hotwords（模型无此接口）；输出无标点,经 ct-punc 补；时间戳由 AED 原生提供；
+              aed_ctx 提供时走 OOM 兜底（空结果自动拆小重试）"""
     if engine == "aed":
-        uttids = [f"u{i}" for i in range(len(audio_paths))]
-        results = model.transcribe(uttids, list(audio_paths))
+        if aed_ctx is not None:
+            results = aed_transcribe_oom_safe(model, audio_paths, aed_ctx)
+        else:
+            uttids = [f"u{i}" for i in range(len(audio_paths))]
+            results = model.transcribe(uttids, list(audio_paths))
         # AED 内部异常时会返回空列表或短列表（feat_extractor/beam search 失败均如此），
         # 必须补齐到与输入等长（缺失项记空文本），否则下游 zip 截断会漏赋字段
         if len(results) < len(audio_paths):
@@ -368,6 +386,102 @@ def split_long_segments(segments, max_ms):
     return out
 
 
+def aed_batch_plan(paths, batch_size, budget_s):
+    """AED 批量计划: 顺序分组,批内段数 <= batch_size 且总时长 <= budget_s。
+    单段自身超预算时独占一批。显存峰值随批内总音频时长增长,固定 8 段一批时
+    60s 段×8 是注意力显存峰值主因,故按双上限分批。"""
+    import soundfile as sf
+    batches, cur, cur_s = [], [], 0.0
+    for p in paths:
+        d = float(sf.info(str(p)).duration)
+        if cur and (len(cur) >= batch_size or cur_s + d > budget_s):
+            batches.append(cur)
+            cur, cur_s = [], 0.0
+        cur.append(p)
+        cur_s += d
+    if cur:
+        batches.append(cur)
+    return batches
+
+
+def split_wav_at_quiet(wav_path, work_dir, depth):
+    """在 25%-75% 时长区间找 50ms 能量最低点把 wav 二分。VAD 段是连续语音,
+    最静点是可用的最优启发(可能切在语流中间,仅在 OOM 重试时触发)。
+    返回 (前段路径, 后段路径, 切点ms)"""
+    import soundfile as sf
+    y, sr = sf.read(str(wav_path))
+    win = max(1, int(0.05 * sr))
+    n_frames = len(y) // win
+    if n_frames < 4:
+        mid = len(y) // 2
+    else:
+        energy = (y[:n_frames * win].reshape(n_frames, win) ** 2).mean(axis=1)
+        lo, hi = n_frames // 4, max(n_frames // 4 + 1, (n_frames * 3) // 4)
+        k = lo + int(np.argmin(energy[lo:hi]))
+        mid = int((k + 0.5) * win)
+    stem = Path(str(wav_path)).stem
+    pa = work_dir / f"{stem}_d{depth}a.wav"
+    pb = work_dir / f"{stem}_d{depth}b.wav"
+    sf.write(str(pa), y[:mid], sr)
+    sf.write(str(pb), y[mid:], sr)
+    return str(pa), str(pb), mid / sr * 1000.0
+
+
+def _ascii_boundary(ch):
+    return ch.isascii() and (ch.isalnum() or ch in ".,!?;")
+
+
+def merge_aed_results(ra, rb, offset_s, uttid):
+    """二分重试结果合并: 文本拼接(英文词界补空格) + 后段字级时间戳平移 + 置信度取小。
+    返回单元素列表,字段形状与 model.transcribe 输出一致"""
+    a, b = ra[0], rb[0]
+    ta, tb = (a.get("text") or ""), (b.get("text") or "")
+    sep = " " if (ta and tb and (_ascii_boundary(ta[-1]) or _ascii_boundary(tb[0]))) else ""
+    ts_a = a.get("timestamp") or []
+    ts_b = [[c, round(s + offset_s, 3), round(e + offset_s, 3)]
+            for c, s, e in (b.get("timestamp") or [])]
+    confs = [r["confidence"] for r in (a, b) if r.get("confidence") is not None]
+    out = {"uttid": uttid, "text": (ta + sep + tb).strip()}
+    if confs:
+        out["confidence"] = round(min(confs), 3)
+    durs = [r["dur_s"] for r in (a, b) if r.get("dur_s") is not None]
+    if durs:
+        out["dur_s"] = round(sum(durs), 3)
+    if ts_a or ts_b:
+        out["timestamp"] = ts_a + ts_b
+    return [out]
+
+
+def aed_transcribe_oom_safe(model, audio_paths, ctx, depth=0):
+    """AED 转写的显存兜底。FireRed transcribe 内部吞掉一切异常(fireredasr2/asr.py
+    的 try/except),OOM 的表现是整批返回空文本而非抛错,故以"空结果"为重试信号:
+    批 -> 拆成单段重试;单段仍空 -> 静音点二分递归,结果按切点偏移合并。
+    深度与最短段长双限制;到限仍空则原样返回(真静音/纯噪声场景)。"""
+    import soundfile as sf
+    import torch
+    results = model.transcribe([f"u{i}" for i in range(len(audio_paths))], list(audio_paths))
+    if results and any((r.get("text") or "").strip() for r in results):
+        return results
+    if not audio_paths or depth >= ctx["max_depth"]:
+        return results
+    durs = [float(sf.info(str(p)).duration) for p in audio_paths]
+    if len(audio_paths) == 1 and durs[0] < ctx["min_split_s"]:
+        return results
+    torch.cuda.empty_cache()
+    ctx["log"](f"[warn] AED 批次({len(audio_paths)} 段)返回空结果,疑似显存不足,拆小重试(深度 {depth})")
+    if len(audio_paths) > 1:
+        out = []
+        for i, p in enumerate(audio_paths):
+            out.extend(aed_transcribe_oom_safe(model, [p], ctx, depth))
+        return out
+    a_path, b_path, split_ms = split_wav_at_quiet(audio_paths[0], ctx["work_dir"], depth)
+    ra = aed_transcribe_oom_safe(model, [a_path], ctx, depth + 1)
+    rb = aed_transcribe_oom_safe(model, [b_path], ctx, depth + 1)
+    if len(ra) == 1 and len(rb) == 1:
+        return merge_aed_results(ra, rb, split_ms / 1000.0, "u0")
+    return ra + rb
+
+
 def absorb_tiny_clusters(embeddings, labels, segments, max_cluster_ms=5000):
     """把总时长过短的小簇并入声纹最相似的大簇（消除碎段形成的假说话人）。
     背景：数百毫秒级碎段的声纹嵌入不稳定，聚类时易自成簇（实测 23 分钟单人口播
@@ -513,7 +627,7 @@ def main():
     ap.add_argument("--denoise", action="store_true", help="先跑 ZipEnhancer 降噪(含 BGM/强噪时试;白噪声实测无明显收益)")
     ap.add_argument("--threshold", type=float, default=0.75,
                     help="声纹余弦聚类阈值(声音相近漏分调低0.65-0.7,同人被拆调高0.8)")
-    ap.add_argument("--batch-size", type=int, default=8, help="diarize 分段转写批大小")
+    ap.add_argument("--batch-size", type=int, default=8, help="转写批大小(AED 引擎另受批内总时长预算限制,默认每批最多 120s)")
     ap.add_argument("--max-new-tokens", type=int, default=2048, help="单段最大生成 token 数")
     ap.add_argument("--no-t2s", action="store_true", help="关闭默认的繁->简转换(保留模型原始输出)")
     ap.add_argument("--device", default="cuda:0", help="推理设备,无 N 卡用 cpu")
@@ -609,7 +723,17 @@ def main():
     def infer(paths):
         """统一识别入口（按引擎分发,批量）"""
         out = []
-        bs = args.batch_size if use_aed else max(args.batch_size, 8)  # AED 批小些更稳
+        if use_aed:
+            # 时长感知分批: 段数≤--batch-size 且批内总时长≤AED_BATCH_BUDGET_S;
+            # 空结果(疑似 OOM)自动拆小重试
+            aed_ctx = {"work_dir": work_dir, "log": log,
+                       "min_split_s": AED_MIN_SPLIT_S, "max_depth": AED_MAX_SPLIT_DEPTH}
+            for chunk in aed_batch_plan(paths, args.batch_size, AED_BATCH_BUDGET_S):
+                out.extend(transcribe_batch(model, processor, chunk, args.language,
+                                            hotwords, args.max_new_tokens, t2s=t2s, matcher=matcher,
+                                            punc=punc, engine=args.engine, aed_ctx=aed_ctx))
+            return out
+        bs = max(args.batch_size, 8)
         for i in range(0, len(paths), bs):
             out.extend(transcribe_batch(model, processor, paths[i:i + bs], args.language,
                                         hotwords, args.max_new_tokens, t2s=t2s, matcher=matcher,
