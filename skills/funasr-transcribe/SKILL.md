@@ -110,6 +110,7 @@ python av_to_transcript_and_minutes.py 录像.mp4 --asr-engine aed  # 中/英/�
 python av_to_transcript_and_minutes.py 录像.mp4 --replace "小蜜=>小米"                  # 专名确定性纠错
 python av_to_transcript_and_minutes.py 噪声录像.mp4 --denoise --vad firered           # 强噪前处理 + 更低误报 VAD
 python av_to_transcript_and_minutes.py 录像.mp4 --asr-extra "--fuzzy --min-seg 300"   # 其余 qwen_asr 参数透传
+python av_to_transcript_and_minutes.py 素材目录 --clean --log     # 只留成稿 + 运行日志落盘
 python av_to_transcript_and_minutes.py 录像.mp4 --verbose        # 实时看各子进程输出，排查卡顿/失败
 ```
 
@@ -117,8 +118,14 @@ python av_to_transcript_and_minutes.py 录像.mp4 --verbose        # 实时看�
 
 - 转写结果按配置分文件缓存（阈值 / 热词 / 人名 / 字幕 / **识别引擎** / 额外 ASR 参数任一不同即互不复用），最贵环节支持断点续跑。
 - 完成判定为 md 与 docx 齐备：只有 md 而缺 docx（首跑时未装 article-format）时只补排版，不重跑分离与转写。
+- `--clean` 完成后删除中间件（三份 wav 与转写缓存 json），只留成稿；对已完成素材加 `--clean` 也会顺手清理残留。注意缓存被删后换参数重转会重新走一遍分离。
+- `--log` 把运行输出追加写入 `<输出目录>/run.log`（终端与文件双写）。
+- 跑前查显存，可用量低于 4 GB 时提示先停其它占卡程序或用 `--no-separate`。
+- 素材无音轨（或音频损坏）归类为「无音轨」单独计数，不再整段抛 ffmpeg 原始输出。
+- 转写后只得到 1 个说话人、且用的是默认 campp 时，提示可改用 `--meeting` 或 pyannote 重跑。
+- 批量打印 `[i/N]` 计数与每个素材用时，收尾给总耗时与均值。
 - 批量时单个文件失败只计一次失败并继续下一个（素材损坏、缺 ffmpeg/demucs 都不会中断整批），失败信息打印子进程错误尾部 20 行。
-- 各级子进程输出统一按 UTF-8 收发（子进程 `PYTHONIOENCODING=utf-8` + 父进程 `encoding="utf-8", errors="replace"`）；中文 Windows 下即使外层已设 UTF-8 环境变量，也不会因 cp936 解码丢日志。
+- 各级子进程输出统一按 UTF-8 收发（子进程 `PYTHONIOENCODING=utf-8` + 父进程 `encoding="utf-8", errors="replace"`，stdout 与 stderr 都锁）；中文 Windows 下不会因 cp936 解码丢日志或显示乱码。
 - 产物同落 `<输出>/<文件名>/`：`人声.wav`、`背景音.wav`、`人声_转写用.wav`、`转写结果*.json`、`转写文稿-<名>.md/.docx` 或 `会议原文-<名>.md/.docx`（另加 `.srt` 时）。
 - Demucs 在静音段留低电平伪影会让 VAD 切不出段，脚本固定用 `agate=threshold=-40dB` 还原真静音，勿删这一环。
 - article-format 定位顺序：`ARTICLE_SKILL_DIR` → `~/.zcode/skills` → `~/.dsh/skills` → `~/.agents/skills` → `~/.claude/skills` → 仓库内 `skills/`；找不到时只出 md 并在 stderr 提示，不报错。

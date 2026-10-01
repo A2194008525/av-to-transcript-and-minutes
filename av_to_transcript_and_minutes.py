@@ -28,15 +28,24 @@
   --srt                   额外产出字级时间戳字幕
   --asr-engine aed        换识别引擎（中/英/粤更准）；换引擎会自动用新缓存重转，不复用旧结果
   --replace "错=>对"       确定性专名纠错（同音异字可配 --asr-extra "--fuzzy"），比热词偏置可靠
+  --replace-file 词典.txt  纠错词典文件，每行一条 "错=>对"
   --denoise               转写前 ZipEnhancer 降噪（仅真实含 BGM/强噪素材）
   --vad firered           改 VAD 后端（默认 fsmn）
   --asr-extra "--min-seg 300"  其余 qwen_asr 参数原样透传
+  --clean                 完成后删除中间件（三份 wav 与转写缓存 json），只留成稿
+  --log                   本次运行输出落 <输出目录>/run.log
   --verbose               实时透传子进程输出，排查卡顿与失败原因用
+
+运行期自检：
+  跑前查显存，可用量不足给出提示（不阻断）；素材无音轨时直接归类为「无音轨」而不是抛 ffmpeg 原始输出；
+  转写后若只得到 1 个说话人且用的是默认 campp，会提示改用 --meeting 或 pyannote 重试；
+  批量处理打印 [i/N] 计数与每个素材用时，收尾给总耗时与均值。
 
 完成判定与续跑：
   md 与 docx 齐备才算完成；只有 md 而缺 docx（首跑时未装 article-format）时只补排版，
   不重跑分离与转写。转写按配置分文件缓存，阈值/热词/人名/字幕/识别引擎/额外参数任一不同
-  即互不复用；--force 才全部重跑。
+  即互不复用；--force 才全部重跑。注意 --clean 会删掉缓存 json 与中间 wav：之后若要换参数
+  重转，会重新走一遍分离（这是有意取舍，用 --clean 换磁盘空间）。
 """
 import argparse
 import hashlib
@@ -46,6 +55,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -107,6 +117,87 @@ def split_asr_extra(text: str) -> list:
     if buf:
         tokens.append("".join(buf))
     return tokens
+
+
+class AudioTrackMissing(RuntimeError):
+    """素材没有可解析的音轨：视频无音轨，或音频文件损坏/非有效音频"""
+
+
+class _Tee:
+    """把标准输出/错误同时写到终端与日志文件（--log 用）"""
+
+    def __init__(self, *streams):
+        self.streams = streams
+
+    def write(self, data):
+        for s in self.streams:
+            try:
+                s.write(data)
+                s.flush()
+            except Exception:
+                pass
+        return len(data)
+
+    def flush(self):
+        for s in self.streams:
+            try:
+                s.flush()
+            except Exception:
+                pass
+
+    def isatty(self):
+        return False
+
+    def reconfigure(self, **kwargs):  # 兼容调用方对 stdout 的 reconfigure
+        pass
+
+
+def gpu_memory_mb():
+    """返回 (总显存, 已用显存) 单位 MB；无 nvidia-smi 或读不到时返回 None"""
+    try:
+        out = run_output(["nvidia-smi", "--query-gpu=memory.total,memory.used",
+                          "--format=csv,noheader,nounits"])
+    except (FileNotFoundError, OSError):
+        return None
+    first = out.strip().splitlines()[0].strip() if out.strip() else ""
+    parts = [p.strip() for p in first.split(",")]
+    if len(parts) != 2:
+        return None
+    try:
+        return int(parts[0]), int(parts[1])
+    except ValueError:
+        return None
+
+
+def warn_low_vram(need_mb: int = 4096) -> None:
+    """跑前显存预检（只提示不阻断）。实测参考：本链路峰值增量约 4.4 GB，
+    Demucs 与转写串行，各占一段峰值；卡上若已有常驻服务容易挤到上限。"""
+    mem = gpu_memory_mb()
+    if mem is None:
+        return
+    total, used = mem
+    free = total - used
+    if free < need_mb:
+        print(f"[提示] 显存可用约 {free} MB（已用 {used} / 共 {total} MB），低于建议的 {need_mb} MB。"
+              f"可先停掉其它占卡程序，或用 --no-separate 省下 Demucs 那一份", file=sys.stderr)
+
+
+def clean_intermediates(stem_dir: Path) -> list:
+    """--clean：删掉分离与转写的中间件，只留成稿（转写文稿/会议原文的 md、docx、srt）。
+    拆轨产物（无声视频/完整音轨）与用户素材不动——它们是可以复用的分流件。"""
+    names = ["人声.wav", "背景音.wav", "人声_转写用.wav",
+             "人声_转写用.json", "人声_转写用.srt", "_asr_job.json"]
+    names += [p.name for p in stem_dir.glob("转写结果*.json")]
+    removed = []
+    for name in sorted(set(names)):
+        p = stem_dir / name
+        if p.is_file():
+            try:
+                p.unlink()
+                removed.append(name)
+            except OSError:
+                pass
+    return removed
 
 
 def asr_script() -> Path:
@@ -291,6 +382,14 @@ def transcribe_and_write_article(stem_dir: Path, stem: str, force: bool,
                    str(vocals_asr)], env=child_env())
     print(f"[转写] {stem}：说话人分离转写中（首次较慢；命中缓存直接复用）")
     payload = call_asr(vocals_asr, opts, force)
+    # 说话人结果自检：默认 campp 在语音段不足 2 段时会跳过聚类，把所有人归到说话人 0；
+    # 这时给出可执行的下一步，而不是让用户拿着错误的单一说话人继续用
+    spk_ids = {l.get("spk") for l in (payload.get("lines") or [])}
+    if (len(spk_ids) <= 1 and not meeting
+            and opts.get("diarize_engine") != "pyannote" and not opts.get("names")):
+        print("[提示] 本次只输出 1 个说话人：campp 声纹聚类在语音段不足时会跳过聚类。"
+              "如需区分说话人，可加 --meeting 或 --diarize-engine pyannote 并用 --force 重跑",
+              file=sys.stderr)
     md_body = meeting_md(payload, stem) if meeting else transcript_md(payload, stem)
     if not md_body:
         return "novoice"
@@ -323,8 +422,19 @@ def separate_one(media: Path, out_dir: Path, force: bool, do_asr: bool = True,
         # --no-separate 只产出「人声.wav」（无背景音），完成判定要对齐实际产物
         all_done = (stem_dir / "人声.wav").exists() if no_separate else separated
     if all_done and not force:
+        if opts.get("clean"):
+            removed = clean_intermediates(stem_dir)
+            if removed:
+                print(f"[清理] {media.stem}：移除中间件 {len(removed)} 个（--clean）")
         return "skip"
     stem_dir.mkdir(parents=True, exist_ok=True)
+
+    # 音轨预检：无音轨的文件要到拆轨阶段才失败，而 ffmpeg 的原始输出会把真原因埋在末尾，
+    # 这里提前给出可理解的结论
+    if not probe_audio_codec(media):
+        what = ("音频文件无法解析音轨（可能损坏或不是有效音频）" if is_audio
+                else "视频里没有音轨")
+        raise AudioTrackMissing(what)
 
     # 1) FFmpeg 拆轨（仅视频输入；音频输入源即完整音频，跳过）
     if not is_audio:
@@ -362,13 +472,22 @@ def separate_one(media: Path, out_dir: Path, force: bool, do_asr: bool = True,
 
     # 3) 人声转文字 + 文章/纪要排版（--no-asr 可跳过）
     if do_asr:
-        return transcribe_and_write_article(stem_dir, media.stem, force, meeting, opts)
+        result = transcribe_and_write_article(stem_dir, media.stem, force, meeting, opts)
+        if opts.get("clean") and result in ("done", "redocx"):
+            removed = clean_intermediates(stem_dir)
+            if removed:
+                print(f"[清理] {media.stem}：移除中间件 {len(removed)} 个（--clean）")
+        return result
     return "done"
 
 
 def main():
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    # stderr 同样锁 UTF-8：提示类信息（说话人、显存、排版技能缺失）此前走 GBK，
+    # 在 UTF-8 控制台下会显示成乱码
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
     ap = argparse.ArgumentParser(description="音视频全自动批量（拆轨 + 人声分离 + 说话人分离转写 → 转写文稿 / 会议纪要）")
     ap.add_argument("input", help="视频/音频文件或包含它们的文件夹")
     ap.add_argument("-o", "--output", help="输出目录（默认 <输入>/separated_out）")
@@ -411,6 +530,13 @@ def main():
                          "变更后自动用新缓存重转")
     ap.add_argument("--verbose", action="store_true",
                     help="实时透传各子进程输出（排查卡顿与失败原因时用）")
+    ap.add_argument("--clean", action="store_true",
+                    help="完成后删除中间件（人声/背景音/转写用 wav 与转写缓存 json），"
+                         "只留成稿 md/docx/srt；拆轨产物保留")
+    ap.add_argument("--log", action="store_true",
+                    help="把本次运行输出追加写入 <输出目录>/run.log，便于批量跑完回溯")
+    ap.add_argument("--replace-file", default=None,
+                    help="专名纠错词典文件（每行 '错=>对'），等价于 qwen_asr.py 的同名参数")
     args = ap.parse_args()
 
     src = Path(args.input)
@@ -432,7 +558,8 @@ def main():
         if args.diarize_engine == "auto" else args.diarize_engine
     # 额外 ASR 参数：显式项 + --asr-extra 合并，统一进命令行与缓存键
     extra = []
-    for flag, val in (("--replace", args.replace), ("--language", args.language),
+    for flag, val in (("--replace", args.replace), ("--replace-file", args.replace_file),
+                      ("--language", args.language),
                       ("--max-line", args.max_line), ("--merge-gap", args.merge_gap),
                       ("--vad", args.vad)):
         if val is not None:
@@ -447,10 +574,27 @@ def main():
     opts = {"threshold": args.threshold, "diarize_engine": diarize_engine,
             "hotwords": args.hotwords, "names": args.names, "srt": args.srt,
             "engine": args.asr_engine if args.asr_engine != "qwen" else None,
-            "extra": extra, "verbose": args.verbose}
+            "extra": extra, "verbose": args.verbose, "clean": args.clean}
 
-    ok = skip = fail = novoice = redocx = 0
-    for v in medias:
+    # 日志落盘：终端与 run.log 双写，批量跑完还能回溯
+    log_path = None
+    log_handle = None
+    if args.log:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        log_path = out_dir / "run.log"
+        log_handle = log_path.open("a", encoding="utf-8")
+        sys.stdout = _Tee(sys.stdout, log_handle)
+        sys.stderr = _Tee(sys.stderr, log_handle)
+        print(f"\n===== 运行开始 {time.strftime('%Y-%m-%d %H:%M:%S')}，素材 {len(medias)} 个 =====")
+
+    warn_low_vram()
+
+    total = len(medias)
+    run_t0 = time.time()
+    ok = skip = fail = novoice = redocx = invalid = 0
+    for idx, v in enumerate(medias, 1):
+        item_t0 = time.time()
+        print(f"\n[{idx}/{total}] {v.name}")
         try:
             r = separate_one(v, out_dir, args.force, do_asr=not args.no_asr,
                              meeting=args.meeting, opts=opts,
@@ -467,6 +611,10 @@ def main():
             else:
                 ok += 1
                 print(f"[完成] {v.name} → {out_dir / v.stem}")
+        except AudioTrackMissing as e:
+            # 素材本身没有音轨（或音频损坏）：不算处理失败，单独归类
+            invalid += 1
+            print(f"[无音轨] {v.name}：{e}")
         except subprocess.CalledProcessError as e:
             fail += 1
             # 打印失败尾部 20 行：原先只留最后一行，真正原因往往在上面几行；
@@ -483,8 +631,22 @@ def main():
             # 兜底：缺 ffmpeg/demucs（FileNotFoundError）、缓存 JSON 损坏等不再中断整批
             fail += 1
             print(f"[失败] {v.name}：{type(e).__name__}: {e}")
+        print(f"    用时 {time.time() - item_t0:.1f} 秒（{idx}/{total}）")
 
-    print(f"\n汇总：完成 {ok} / 补排版 {redocx} / 无人声 {novoice} / 跳过 {skip} / 失败 {fail}，输出目录：{out_dir}")
+    elapsed = time.time() - run_t0
+    print(f"\n汇总：完成 {ok} / 补排版 {redocx} / 无人声 {novoice} / 跳过 {skip} / 失败 {fail}"
+          + (f" / 无音轨 {invalid}" if invalid else "")
+          + f"，输出目录：{out_dir}")
+    if total:
+        print(f"耗时：总计 {elapsed:.1f} 秒，平均 {elapsed / total:.1f} 秒/个（{total} 个素材）")
+
+    if log_handle is not None:
+        print(f"===== 运行结束 {time.strftime('%Y-%m-%d %H:%M:%S')} =====")
+        # 先恢复原始流再关闭文件，避免 close 后仍有输出落在已关闭的句柄上
+        sys.stdout = sys.stdout.streams[0]
+        sys.stderr = sys.stderr.streams[0]
+        log_handle.close()
+        print(f"[日志] 已写入 {log_path}")
 
 
 if __name__ == "__main__":
