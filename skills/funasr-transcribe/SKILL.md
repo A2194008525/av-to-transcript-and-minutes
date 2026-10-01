@@ -13,6 +13,8 @@ description: "本地语音转文字（离线、GPU 加速、无需 API 密钥）
 
 | 用户需求 | 用法 |
 |---------|------|
+| **视频/音频一键出文稿**（拆轨 + 人声分离 + 说话人分离转写 + 规范 docx） | `python <仓库根>/av_to_transcript_and_minutes.py <视频或音频>`（见下节） |
+| 视频/会议要带时间戳与说话人标签的原文 | 上条加 `--meeting`（出会议原文底稿，正式纪要再按 meeting-notes-expert 提炼） |
 | **日常转写（首选）**：单人或不需要区分说话人 | `python <技能目录>/scripts/qwen_asr.py <音频文件>` |
 | 会议/访谈，要区分"谁说了什么" | `python .../qwen_asr.py <音频文件> --diarize` |
 | 要字幕文件（SRT，可带说话人标签） | 加 `--srt`（fa-zh 强制对齐，字级时间戳） |
@@ -93,6 +95,35 @@ python -c "import funasr, torch; print(funasr.__version__, torch.cuda.is_availab
 ## 详细参考
 
 模型清单与下载 ID、fa-zh 强制对齐 / 专名纠错 / FireRedVAD / ZipEnhancer 的接口与实测数据、ct-punc / emotion2vec 调用代码、环境安装与修复步骤、完整踩坑记录 → 读 **references/advanced.md**（按需加载，不预读）。
+
+## 全自动链路 av_to_transcript_and_minutes.py（视频/音频 → 文稿 → docx）
+
+仓库根目录的主脚本把全流程串成一条命令：FFmpeg 拆轨（无损 copy）→ Demucs 人声/背景音分离 → agate 噪声门 → `qwen_asr.py --diarize` 转写 → 组稿 → article-format 规范 docx。视频与音频通用，逐环节幂等可续跑。
+
+```bash
+python av_to_transcript_and_minutes.py 会议录像.mp4              # 默认出「转写文稿」docx（每 4 句一段）
+python av_to_transcript_and_minutes.py 会议录像.mp4 --meeting    # 出「会议原文」docx（带 [分:秒] 时间戳与说话人标签）
+python av_to_transcript_and_minutes.py 录音.m4a --no-separate    # 纯人声素材：跳过 Demucs 直接转写（更快）
+python av_to_transcript_and_minutes.py 素材目录 -o 输出目录        # 批量；默认落 <输入>/separated_out
+python av_to_transcript_and_minutes.py 录像.mp4 --names "0=张三,1=李四" --srt
+python av_to_transcript_and_minutes.py 录像.mp4 --asr-engine aed  # 中/英/粤更准（换引擎自动重转）
+python av_to_transcript_and_minutes.py 录像.mp4 --replace "小蜜=>小米"                  # 专名确定性纠错
+python av_to_transcript_and_minutes.py 噪声录像.mp4 --denoise --vad firered           # 强噪前处理 + 更低误报 VAD
+python av_to_transcript_and_minutes.py 录像.mp4 --asr-extra "--fuzzy --min-seg 300"   # 其余 qwen_asr 参数透传
+python av_to_transcript_and_minutes.py 录像.mp4 --verbose        # 实时看各子进程输出，排查卡顿/失败
+```
+
+行为要点：
+
+- 转写结果按配置分文件缓存（阈值 / 热词 / 人名 / 字幕 / **识别引擎** / 额外 ASR 参数任一不同即互不复用），最贵环节支持断点续跑。
+- 完成判定为 md 与 docx 齐备：只有 md 而缺 docx（首跑时未装 article-format）时只补排版，不重跑分离与转写。
+- 批量时单个文件失败只计一次失败并继续下一个（素材损坏、缺 ffmpeg/demucs 都不会中断整批），失败信息打印子进程错误尾部 20 行。
+- 各级子进程输出统一按 UTF-8 收发（子进程 `PYTHONIOENCODING=utf-8` + 父进程 `encoding="utf-8", errors="replace"`）；中文 Windows 下即使外层已设 UTF-8 环境变量，也不会因 cp936 解码丢日志。
+- 产物同落 `<输出>/<文件名>/`：`人声.wav`、`背景音.wav`、`人声_转写用.wav`、`转写结果*.json`、`转写文稿-<名>.md/.docx` 或 `会议原文-<名>.md/.docx`（另加 `.srt` 时）。
+- Demucs 在静音段留低电平伪影会让 VAD 切不出段，脚本固定用 `agate=threshold=-40dB` 还原真静音，勿删这一环。
+- article-format 定位顺序：`ARTICLE_SKILL_DIR` → `~/.zcode/skills` → `~/.dsh/skills` → `~/.agents/skills` → `~/.claude/skills` → 仓库内 `skills/`；找不到时只出 md 并在 stderr 提示，不报错。
+- 依赖 ffmpeg / ffprobe / demucs（均在 PATH）与 `qwen_asr.py`（同目录或 `skills/funasr-transcribe/scripts/` 自动定位，可用 `VOICE_ASR_SCRIPT` 覆盖）。
+- 短素材用默认 campp 聚类可能分不出说话人（VAD 段不足 2 段时按单一说话人处理）；要区分说话人的会议素材加 `--meeting`（自动走 pyannote）。
 
 ## 单元自测
 

@@ -35,8 +35,10 @@ python av_to_transcript_and_minutes.py <视频/音频文件或文件夹> [-o 输
 - **说话人分离双引擎**：
   - `pyannote`（community-1，会议场景默认）——分割模型原生处理**重叠语音**，实测真实 28 分钟会议从 35 个假说话人收敛到 2 个
   - `campp`（VAD + cam++ 声纹聚类）——轻量，单人/访谈素材够用
-- **字幕与纠错**：`--srt` 出字级时间戳字幕；`--hotwords` 热词偏置；`--names` 说话人真名映射
-- **断点续跑**：转写（最贵环节）结果按参数指纹缓存，中断重跑自动跳过
+- **字幕与纠错**：`--srt` 出字级时间戳字幕；`--replace` 确定性专名纠错（比 `--hotwords` 偏置可靠）；`--names` 说话人真名映射；`--asr-extra` 透传其余引擎参数
+- **断点续跑**：转写（最贵环节）结果按参数指纹缓存——阈值 / 热词 / 人名 / 字幕 / **识别引擎** / 额外 ASR 参数任一不同即互不复用，**切换识别引擎不会误用旧结果**
+- **完成判定与补排版**：md 与 docx 齐备才算完成；首次运行缺 `article-format` 时只出 md，补装后重跑自动只补 docx，无需 `--force` 全量重跑
+- **批量容错与可观测**：单个文件失败只计一次失败并继续（素材损坏、缺 ffmpeg/demucs 都不中断整批）；各级子进程输出统一 UTF-8 收发，中文 Windows 不再因 cp936 解码错位丢日志；`--verbose` 可实时透传子进程输出
 - **批量处理**：输入文件夹时递归处理其中所有音视频
 
 ---
@@ -94,10 +96,18 @@ python av_to_transcript_and_minutes.py ./素材目录 --meeting --srt \
 | `--meeting` | 产出会议原文（带时间戳+说话人标签）而非普通转写文稿 |
 | `--srt` | 额外产出 `.srt` 字幕（字级时间戳） |
 | `--diarize-engine auto\|pyannote\|campp` | 说话人分离引擎（`auto`=会议用 pyannote，其余 campp） |
+| `--asr-engine qwen\|aed` | 识别引擎：`qwen`（默认，多语言）／`aed`（中英粤更准）；**换引擎自动用新缓存重转** |
+| `--replace "错=>对,错2=>对2"` | 识别后确定性替换，专名纠错比 `--hotwords` 可靠（同音异字配 `--asr-extra "--fuzzy"`） |
+| `--denoise` | 转写前 ZipEnhancer 降噪（仅真实含 BGM/强噪素材；干净素材不加更好） |
+| `--vad fsmn\|firered` | VAD 切段后端（默认 `fsmn`；`firered` 误报更低） |
+| `--language zh\|en\|yue\|…` | 强制语言，默认自动检测 |
+| `--max-line N` / `--merge-gap N` | 单条字幕最大字数（默认 28）／相邻同说话人合并间隔 ms（默认 800，0 关闭） |
+| `--asr-extra "--fuzzy --min-seg 300"` | 其余 `qwen_asr.py` 参数原样透传（同样计入缓存指纹） |
 | `--names "0=张三,1=李四"` | 说话人真名映射 |
 | `--hotwords "词1,词2"` | 热词偏置，提升专名识别率 |
 | `--no-separate` | 跳过人声分离（纯人声音频可直接转写） |
 | `--no-asr` | 只做拆轨/分离，不转写 |
+| `--verbose` | 实时透传各子进程输出，排查卡顿与失败原因 |
 | `--force` | 重跑已处理过的素材 |
 | `-o 输出目录` | 指定输出目录（默认输入旁 `separated_out/`） |
 
@@ -127,16 +137,18 @@ python av_to_transcript_and_minutes.py ./素材目录 --meeting --srt \
 ```
 av-to-transcript-and-minutes/
 ├── av_to_transcript_and_minutes.py  # 全自动链路主脚本（①→⑤）
-├── test_pipeline_e2e.py             # 端到端回归（自动合成素材，18 项断言）
+├── test_pipeline_e2e.py             # 端到端回归（自动合成素材，17 项断言）
 ├── requirements.txt
 ├── skills/
 │   ├── funasr-transcribe/
 │   │   ├── SKILL.md                 # 转写技能（Agent 调用规范）
 │   │   └── scripts/
 │   │       ├── qwen_asr.py          # 转写引擎：Qwen3-ASR + pyannote/cam++ + 字幕/纠错
+│   │       ├── firered_mem_patch.py # AED 引擎分块注意力与显存补丁（v2.1）
 │   │       ├── transcribe.py        # 简化入口
 │   │       ├── diarize.py           # 说话人分离（FunASR 路线）
-│   │       └── test_qwen_asr_units.py  # 引擎单元测试
+│   │       ├── test_qwen_asr_units.py       # 引擎单元测试
+│   │       └── test_firered_mem_patch.py    # AED 显存补丁单测
 │   └── meeting-notes-expert/
 │       └── SKILL.md                 # 纪要整理技能（五段式模板）
 └── LICENSE
@@ -153,6 +165,8 @@ python test_pipeline_e2e.py
 # 引擎单元测试（切句/时间戳/碎段合并/超长切分/小簇吸收等纯逻辑）
 python skills/funasr-transcribe/scripts/test_qwen_asr_units.py
 ```
+
+2026-10-01 健壮性改动后实测：`test_pipeline_e2e.py` 17 项断言 **ALL PASS**（自动合成 TTS 视频走完整链路，37 秒）。
 
 实测性能参考（RTX 5070 Ti 16GB，28 分钟中文会议）：
 
