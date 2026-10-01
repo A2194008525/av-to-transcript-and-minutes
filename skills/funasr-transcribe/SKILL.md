@@ -80,6 +80,13 @@ python diarize.py 访谈录音.m4a --threshold 0.7
 5. **`--denoise` 是条件性收益**：实测合成白噪声场景**无改善甚至更差**（「开放时间」→「派班时间」）；仅在真实含 BGM/强噪素材上试，干净素材不加任何前处理最好。
 6. GPU 上模型输出的 tensor 转 numpy 必须先 `.cpu()`；Windows 原生 Python 不认 Git Bash 的 `/tmp` 路径，临时文件用 `tempfile.gettempdir()`。
 7. 字幕时间为字级（fa-zh 强制对齐），比 VAD 段级边界准；单条过长用 `--max-line` 调小。
+8. **`--vad firered` 有两道坎**：① fireredvad 断言输入必须 16kHz，而链路给的是 44.1kHz 立体声，必须先重采样；② 还必须落成 **PCM_16 文件**再喂——它的 fbank 按 int16 数值范围取特征，直接传 float32(-1..1) 会让概率趋近 0 且**不报错**，静默判成「全非语音」（实测 probs max 0.0031 对比正确路径 0.9998）。
+9. **ITN 用自写规则**：WeTextProcessing 依赖 pynini（Windows 只有源码包，需 MSVC 编译，本机装不上），fun_text_processing 不在 PyPI，故由 `itn_zh.py` 自写零依赖规则；只转高置信模式，约数与非数量用法（一起 / 十分 / 三天打鱼 / 三五个）保持原样。单测：`python skills/funasr-transcribe/scripts/test_itn_zh.py`。
+10. **声道分轨必须跳过 Demucs**：Demucs 按立体声混音做人声分离，会打破左右声道独立性，而分轨的价值就在于两路各自干净——`--split-channels` 已自动跳过分离与声纹聚类。
+11. **同一目录内有多份待转写音频时，缓存键必须带 tag**：否则两路声道会命中同一份缓存、转出完全相同的文本（实测踩过）。
+12. **「素材是否本来就干净」无法用能量差判断**（对照实验证伪，勿再尝试）：纯人声差 15.1 dB、人声+背景乐差 12.7 dB，只差 2.4 dB，判据区分不出有无背景。需要跳过分离时手动 `--no-separate`。
+13. **emotion2vec 只做情绪识别，不做音频事件检测**：它输出 8 类情绪（开心/难过/厌恶/中立/生气/惊讶/害怕/兴奋）的整段打分；笑声、掌声这类事件识别不了，需要另装事件检测模型。
+14. **声纹库只在 campp 引擎下可用**：pyannote 路径不产出声纹向量，加了 `--speaker-db` 会提示并跳过；建库用 `--speaker-db-save`，命中阈值默认 0.75（同人被认成新人就调低）。
 
 ## 环境自检
 
@@ -111,6 +118,12 @@ python av_to_transcript_and_minutes.py 录像.mp4 --replace "小蜜=>小米"    
 python av_to_transcript_and_minutes.py 噪声录像.mp4 --denoise --vad firered           # 强噪前处理 + 更低误报 VAD
 python av_to_transcript_and_minutes.py 录像.mp4 --asr-extra "--fuzzy --min-seg 300"   # 其余 qwen_asr 参数透传
 python av_to_transcript_and_minutes.py 素材目录 --clean --log     # 只留成稿 + 运行日志落盘
+python av_to_transcript_and_minutes.py 录像.mp4 --itn             # 逆文本正则化：三百二十万元 -> 320万元
+python av_to_transcript_and_minutes.py 录像.mp4 --asr-engine auto --language zh  # 按语言路由（中/英/粤走 aed）
+python av_to_transcript_and_minutes.py 录像.mp4 --demucs-model htdemucs_ft       # 分离质量优先（慢约 4 倍）
+python av_to_transcript_and_minutes.py 双人录音.wav --split-channels             # 双人分声道录制：声道号即说话人
+python av_to_transcript_and_minutes.py 录音.wav --emotion                        # 8 类情绪分析（写 json 的 emotions）
+python av_to_transcript_and_minutes.py 会议.wav --speaker-db db.json             # 跨文件复用说话人身份
 python av_to_transcript_and_minutes.py 录像.mp4 --verbose        # 实时看各子进程输出，排查卡顿/失败
 ```
 
