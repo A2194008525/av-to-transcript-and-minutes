@@ -119,8 +119,69 @@ def load_punc(device):
         return None
 
 
+def load_speaker_db(path) -> dict:
+    """读声纹库 {"version":1,"speakers":{"张三":[...]}} → {name: 归一化 ndarray}"""
+    try:
+        raw = json.loads(Path(path).read_text(encoding="utf-8"))
+        out = {}
+        for name, vec in (raw.get("speakers") or {}).items():
+            arr = np.asarray(vec, dtype=np.float32).flatten()
+            n = float(np.linalg.norm(arr)) if arr.size else 0.0
+            if n > 0:
+                out[name] = arr / n          # 存进来就归一化，比对时只算点积
+        return out
+    except Exception:
+        return {}
+
+
+def save_speaker_db(path, db: dict) -> None:
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"version": 1,
+               "speakers": {k: [round(float(x), 6) for x in np.asarray(v).flatten()]
+                            for k, v in db.items()}}
+    p.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def match_speaker_db(centroid, db: dict, threshold: float):
+    """库中比对：返回 (最佳名字, 相似度)；低于阈值时名字为 None 但仍回报最高相似度"""
+    if centroid is None or not db:
+        return None, -1.0
+    c = np.asarray(centroid, dtype=np.float32).flatten()
+    n = float(np.linalg.norm(c))
+    if n <= 0:
+        return None, -1.0
+    c = c / n
+    best, best_sim = None, -1.0
+    for name, vec in db.items():
+        if vec.shape != c.shape:
+            continue
+        sim = float(np.dot(c, vec))
+        if sim > best_sim:
+            best, best_sim = name, sim
+    return (best if best_sim >= threshold else None), best_sim
+
+
+def analyze_emotion(audio_path, device):
+    """emotion2vec+large 整段情绪分析，返回分数最高的前三标签；失败返回 None 不阻断。
+
+    能力边界（勿夸大）：它做的是 8 类情绪识别（开心/难过/厌恶/中立/生气/惊讶/害怕/兴奋），
+    **不是音频事件检测**——笑声、掌声这类事件它识别不了，那需要另装事件检测模型。
+    """
+    try:
+        from funasr import AutoModel
+        emo = AutoModel(model="iic/emotion2vec_plus_large", device=device, disable_update=True)
+        r = emo.generate(input=str(audio_path), cache={}, granularity="utterance")
+        pairs = sorted(zip(r[0]["labels"], r[0]["scores"]), key=lambda x: -x[1])[:3]
+        return [{"label": str(l), "score": round(float(s), 4)} for l, s in pairs]
+    except Exception as e:
+        print(f"[warn] emotion2vec 分析失败，跳过情绪标注: {type(e).__name__}: {str(e)[:120]}",
+              file=sys.stderr)
+        return None
+
+
 def transcribe_batch(model, processor, audio_paths, language=None, hotwords=None, max_new_tokens=2048,
-                     t2s=None, matcher=None, punc=None, engine="qwen", aed_ctx=None):
+                     t2s=None, matcher=None, punc=None, engine="qwen", aed_ctx=None, itn=None):
     """批量转写,返回 [{"language","transcription"}, ...]
     Qwen 引擎: 支持 language/hotwords 偏置、自带标点与语言识别
     AED 引擎: 忽略 language/hotwords（模型无此接口）；输出无标点,经 ct-punc 补；时间戳由 AED 原生提供；
@@ -150,6 +211,8 @@ def transcribe_batch(model, processor, audio_paths, language=None, hotwords=None
         for r, txt in zip(results, texts):
             if t2s is not None:
                 txt = t2s(txt)
+            if itn is not None:
+                txt = itn(txt)          # 繁简之后做 ITN：规则表按简体编写
             parsed.append({"language": None, "transcription": apply_replace(txt, matcher),
                            "timestamp": r.get("timestamp"), "confidence": r.get("confidence")})
         return parsed
@@ -167,6 +230,9 @@ def transcribe_batch(model, processor, audio_paths, language=None, hotwords=None
     for item in parsed:
         if t2s is not None and item.get("language") in ("Chinese", "Cantonese"):
             item["transcription"] = t2s(item["transcription"])
+        # ITN 只对中文有意义（规则表是中文数字），免去对英文段做无谓正则
+        if itn is not None and item.get("language") in ("Chinese", "Cantonese", None):
+            item["transcription"] = itn(item["transcription"])
         item["transcription"] = apply_replace(item["transcription"], matcher)
     return parsed
 
@@ -199,12 +265,29 @@ def apply_replace(text, matcher):
 def run_vad(audio_path, backend, device):
     """返回 [[start_ms, end_ms], ...]；fsmn 走 funasr，firered 走 fireredvad"""
     if backend == "firered":
+        import soundfile as sf
         from fireredvad import FireRedVad, FireRedVadConfig
         if not (FIRERED_VAD_DIR / "model.pth.tar").is_file():
             sys.exit(f"FireRedVAD 模型不存在: {FIRERED_VAD_DIR}（需先 modelscope download --model xukaituo/FireRedVAD）")
         cfg = FireRedVadConfig(use_gpu=str(device).startswith("cuda"))
         vad = FireRedVad.from_pretrained(str(FIRERED_VAD_DIR), cfg)
-        result, _ = vad.detect(str(audio_path))
+        # 两道坎，顺序都不能省：
+        # ① fireredvad 的特征提取断言输入必须是 16kHz（core/audio_feat.py:30），而链路给进来的
+        #    通常是 44.1kHz 立体声（Demucs 产物）；fsmn 路线由 funasr 自行重采样，这条必须自己转。
+        # ② 必须落成 PCM_16 文件再喂：它的 fbank 按 int16 数值范围取特征，直接传 float32(-1..1)
+        #    元组会让特征幅度小三万倍左右，模型概率趋近 0——不报错，但判成「全非语音」
+        #    （实测 probs max 0.0031 对比文件路径 0.9998），属静默失效，比崩溃更难发现。
+        data, sr = sf.read(str(audio_path), dtype="float32", always_2d=True)
+        mono = data.mean(axis=1)
+        if sr != 16000:
+            import librosa
+            mono = librosa.resample(mono, orig_sr=sr, target_sr=16000)
+        vad_wav = Path(tempfile.gettempdir()) / f"firered_vad_{os.getpid()}_{int(time.time() * 1000)}.wav"
+        sf.write(str(vad_wav), mono.astype(np.float32), 16000, subtype="PCM_16")
+        try:
+            result, _ = vad.detect(str(vad_wav))
+        finally:
+            vad_wav.unlink(missing_ok=True)
         return [[int(round(s * 1000)), int(round(e * 1000))] for s, e in result["timestamps"]]
     from funasr import AutoModel
     vad = AutoModel(model="fsmn-vad", device=device, disable_update=True)
@@ -621,8 +704,9 @@ def main():
     ap.add_argument("--diarize-engine", choices=["campp", "pyannote"], default="campp",
                     help="说话人分离引擎: campp=VAD+cam++声纹聚类(默认,轻量); "
                          "pyannote=community-1 分割模型(原生处理重叠语音,会议抢话场景更准; 需已装 pyannote.audio)")
-    ap.add_argument("--engine", choices=["qwen", "aed"], default="qwen",
-                    help="识别引擎: qwen=Qwen3-ASR-1.7B(默认,多语言含日文); aed=FireRedASR2-AED(中/英/粤更准,不支持日文,输出经 ct-punc 补标点)")
+    ap.add_argument("--engine", choices=["qwen", "aed", "auto"], default="qwen",
+                    help="识别引擎: qwen=Qwen3-ASR-1.7B(默认,多语言含日文); aed=FireRedASR2-AED(中/英/粤更准,不支持日文,输出经 ct-punc 补标点); "
+                         "auto=按 --language 路由(中/英/粤走 aed,其余走 qwen;未指定语言时保守走 qwen)")
     ap.add_argument("--no-punc", action="store_true", help="aed 引擎不补标点(默认用 ct-punc 补)")
     ap.add_argument("--denoise", action="store_true", help="先跑 ZipEnhancer 降噪(含 BGM/强噪时试;白噪声实测无明显收益)")
     ap.add_argument("--threshold", type=float, default=0.75,
@@ -630,6 +714,18 @@ def main():
     ap.add_argument("--batch-size", type=int, default=8, help="转写批大小(AED 引擎另受批内总时长预算限制,默认每批最多 120s)")
     ap.add_argument("--max-new-tokens", type=int, default=2048, help="单段最大生成 token 数")
     ap.add_argument("--no-t2s", action="store_true", help="关闭默认的繁->简转换(保留模型原始输出)")
+    ap.add_argument("--itn", action="store_true",
+                    help="中文逆文本正则化:三百二十万元->320万元、百分之八十->80%%、二零二六年十月十五日->2026年10月15日(自写规则,零依赖)")
+    ap.add_argument("--emotion", action="store_true",
+                    help="emotion2vec+large 整段情绪分析(8 类情绪,结果写入 json 的 emotions 字段);"
+                         "注意它不做笑声/掌声这类音频事件检测")
+    ap.add_argument("--speaker-db", default=None,
+                    help="声纹库 JSON 路径:跨文件复用说话人身份,命中已知声纹时直接显示库中姓名"
+                         "(仅 campp 引擎可用;pyannote 路径不产声纹向量)")
+    ap.add_argument("--speaker-db-save", action="store_true",
+                    help="把本次识别到的说话人声纹写入 --speaker-db 指定的库(同名覆盖)")
+    ap.add_argument("--speaker-db-threshold", type=float, default=0.75,
+                    help="声纹库命中阈值(余弦相似度,默认 0.75;同人被认成新人的话调低)")
     ap.add_argument("--device", default="cuda:0", help="推理设备,无 N 卡用 cpu")
     ap.add_argument("--job-config", default=None,
                     help="任务配置 JSON 路径（供管线脚本透传参数；与命令行同名参数等价）")
@@ -646,6 +742,18 @@ def main():
             if k not in defaults:
                 sys.exit(f"任务配置含未知项: {k}")
             setattr(args, k, v)
+
+    # --engine auto：按语言路由。中/英/粤在 AED 上实测更准、嘈杂素材更稳；其余语言
+    # （尤其日文，AED 会输出中文乱码）留在 Qwen。未指定语言时无法预知，保守走 Qwen。
+    if args.engine == "auto":
+        lang = (args.language or "").strip().lower()
+        if lang in ("zh", "en", "yue", "chinese", "english", "cantonese"):
+            args.engine = "aed"
+        else:
+            args.engine = "qwen"
+            if not lang:
+                print("[提示] --engine auto 未指定 --language，保守使用 qwen；"
+                      "若素材是中/英/粤，加 --language zh 可自动切到更准的 AED", file=sys.stderr)
 
     # 输入路径校验:拒绝 ".."，realpath 规范化
     if ".." in args.audio:
@@ -710,8 +818,16 @@ def main():
     t2s = build_t2s(args.no_t2s)
     matcher = build_matcher(replace_map, args.fuzzy)
     punc = load_punc(args.device) if (use_aed and not args.no_punc) else None
+    itn_fn = None
+    if args.itn:
+        # itn_zh.py 与本脚本同目录；直接运行/子进程调用时脚本目录在 sys.path[0]
+        try:
+            from itn_zh import normalize as itn_fn
+        except Exception as e:
+            print(f"[warn] ITN 模块加载失败，跳过逆文本正则化: {type(e).__name__}: {e}", file=sys.stderr)
     log(f"[1] {args.engine.upper()} 引擎已加载到 {args.device} ({load_s:.0f}s)"
         + ("" if t2s else "（繁->简已关闭）")
+        + ("；ITN 已启用" if itn_fn is not None else "")
         + (f"；专名纠错 {len(replace_map)} 条" if replace_map else "")
         + ("；ct-punc 已加载" if punc is not None else ""))
     fa = None
@@ -731,13 +847,14 @@ def main():
             for chunk in aed_batch_plan(paths, args.batch_size, AED_BATCH_BUDGET_S):
                 out.extend(transcribe_batch(model, processor, chunk, args.language,
                                             hotwords, args.max_new_tokens, t2s=t2s, matcher=matcher,
-                                            punc=punc, engine=args.engine, aed_ctx=aed_ctx))
+                                            punc=punc, engine=args.engine, aed_ctx=aed_ctx,
+                                            itn=itn_fn))
             return out
         bs = max(args.batch_size, 8)
         for i in range(0, len(paths), bs):
             out.extend(transcribe_batch(model, processor, paths[i:i + bs], args.language,
                                         hotwords, args.max_new_tokens, t2s=t2s, matcher=matcher,
-                                        punc=punc, engine=args.engine))
+                                        punc=punc, engine=args.engine, itn=itn_fn))
         return out
 
     _engine_tag = "FireRedASR2-AED" if use_aed else "Qwen3-ASR-1.7B"
@@ -895,10 +1012,34 @@ def main():
               file=sys.stderr)
         parsed = list(parsed) + [{"transcription": ""}
                                  for _ in range(len(units) - len(parsed))]
+    # 声纹库：跨文件复用说话人身份（同一批会议里不必每次都重新认人）
+    db_names = {}
+    if args.speaker_db:
+        emb = locals().get("embeddings")          # pyannote 路径不产声纹向量
+        if emb is None or not len(labels):
+            print("[提示] --speaker-db 只在 campp 引擎下可用（pyannote 路径不产声纹向量），本次跳过",
+                  file=sys.stderr)
+        else:
+            db = load_speaker_db(args.speaker_db)
+            cents = {}
+            for c in sorted({int(x) for x in labels}):
+                member = emb[labels == c]
+                if len(member):
+                    cents[c] = member.mean(axis=0)
+            for c, cen in cents.items():
+                hit, sim = match_speaker_db(cen, db, args.speaker_db_threshold)
+                if hit:
+                    db_names[c] = hit
+                    log(f"[4c] 声纹库命中: 说话人{c} -> {hit}（相似度 {sim:.3f}）")
+            if args.speaker_db_save:
+                for c, cen in cents.items():
+                    db[names.get(c) or db_names.get(c) or f"说话人{c}"] = cen
+                save_speaker_db(args.speaker_db, db)
+                log(f"[4c] 声纹库已更新: {args.speaker_db}（共 {len(db)} 条）")
     for u, p in zip(units, parsed):
         u["text"] = p["transcription"]
         u["language"] = p.get("language")
-        u["spk_name"] = names.get(u["spk"])
+        u["spk_name"] = names.get(u["spk"]) or db_names.get(u["spk"])
     aligns = None
     if use_aed and all(p.get("timestamp") for p in parsed):
         if all(len(p["timestamp"]) == len(p["transcription"]) for p in parsed):
@@ -921,8 +1062,13 @@ def main():
         lines.append({"spk": u["spk"], "spk_name": u["spk_name"], "start_ms": s_ms, "end_ms": e_ms,
                       "text": text, "language": u.get("language")})
 
+    emotions = analyze_emotion(audio_path, args.device) if args.emotion else None
+    if emotions:
+        log("[5b] 情绪分析: " + "、".join(f"{e['label']} {e['score']:.2f}" for e in emotions))
     payload = {"engine": "Qwen3-ASR-1.7B", "audio": str(audio_path),
                "speakers": names or None, "lines": lines}
+    if emotions:
+        payload["emotions"] = emotions
     if aligns is not None:
         subs = subtitle_units(units, aligns, args.max_line)
         payload["sentences"] = subs

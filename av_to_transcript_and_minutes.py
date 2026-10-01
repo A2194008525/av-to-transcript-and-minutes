@@ -50,6 +50,7 @@
 import argparse
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -200,6 +201,47 @@ def clean_intermediates(stem_dir: Path) -> list:
     return removed
 
 
+def wav_rms_db(path: Path):
+    """读 wav 算整体 RMS（dBFS）；读不到或空文件返回 None"""
+    try:
+        import numpy as np
+        import soundfile as sf
+        data, _ = sf.read(str(path), dtype="float32", always_2d=True)
+        if data.size == 0:
+            return None
+        mono = data.mean(axis=1)
+        rms = float(np.sqrt((mono ** 2).mean()))
+        return 20 * math.log10(max(rms, 1e-9))
+    except Exception:
+        return None
+
+
+def estimate_snr_db(path: Path):
+    """粗估信噪比（dB）：20ms 分帧算 RMS，取 90 分位当语音、10 分位当底噪。
+    只用分位数做相对判断，不做绝对声压校准；样本不足或读不到返回 None。"""
+    try:
+        import numpy as np
+        import soundfile as sf
+        data, sr = sf.read(str(path), dtype="float32", always_2d=True)
+        if data.size == 0:
+            return None
+        mono = data.mean(axis=1)
+        win = max(int(sr * 0.02), 1)
+        n = len(mono) // win
+        if n < 5:
+            return None
+        frames = mono[:n * win].reshape(n, win)
+        rms = np.sqrt((frames ** 2).mean(axis=1))
+        rms = rms[rms > 0]
+        if rms.size < 5:
+            return None
+        speech = float(np.percentile(rms, 90))
+        noise = float(np.percentile(rms, 10))
+        return 20 * math.log10(max(speech, 1e-9) / max(noise, 1e-9))
+    except Exception:
+        return None
+
+
 def asr_script() -> Path:
     """定位转写引擎 qwen_asr.py（惰性查找：仅在真正转写时调用，不影响 --help）：
     环境变量 VOICE_ASR_SCRIPT → 同目录 → 技能目录（本仓库布局）"""
@@ -256,11 +298,15 @@ def probe_audio_codec(video: Path) -> str:
 
 
 def asr_cache_name(threshold=None, diarize_engine=None, hotwords=None, names=None,
-                   srt=False, engine=None, extra=None) -> str:
+                   srt=False, engine=None, extra=None, tag=None) -> str:
     """转写缓存文件名：任一影响结果的配置不同 → 缓存不同。
     识别引擎（qwen/aed）输出的文本不同，是缓存键的必需维度——漏掉它会让人以为换了引擎、
-    实际拿到的是旧引擎结果；热词、人名、字幕、额外 ASR 参数同理不可与默认结果混用。"""
+    实际拿到的是旧引擎结果；热词、人名、字幕、额外 ASR 参数同理不可与默认结果混用。
+    tag 用于同一目录内存在多份待转写音频的场景（声道分轨），缺了它两路会命中同一份缓存、
+    转出完全相同的文本（实测踩过）。"""
     parts = []
+    if tag:
+        parts.append(str(tag))
     if engine == "aed":
         parts.append("aed")
     if diarize_engine == "pyannote":
@@ -278,7 +324,7 @@ def asr_cache_name(threshold=None, diarize_engine=None, hotwords=None, names=Non
     return "转写结果" + ("_" + "_".join(parts) if parts else "") + ".json"
 
 
-def call_asr(vocals: Path, opts: dict, force: bool = False):
+def call_asr(vocals: Path, opts: dict, force: bool = False, tag: str = None):
     """调 qwen_asr.py 转写（恒走 --diarize：说话人分离），返回结构化 JSON。
     opts 键：threshold / diarize_engine / hotwords / names / srt / engine（识别引擎）
              extra（额外 ASR 参数列表，命令行追加）/ verbose（子进程输出实时透传）
@@ -287,7 +333,7 @@ def call_asr(vocals: Path, opts: dict, force: bool = False):
     extra = list(opts.get("extra") or [])
     cache_json = vocals.parent / asr_cache_name(
         opts.get("threshold"), opts.get("diarize_engine"), opts.get("hotwords"),
-        opts.get("names"), bool(opts.get("srt")), opts.get("engine"), extra)
+        opts.get("names"), bool(opts.get("srt")), opts.get("engine"), extra, tag)
     if cache_json.exists() and not force:
         return json.loads(cache_json.read_text(encoding="utf-8"))
     raw_json = vocals.parent / (vocals.stem + ".json")  # qwen_asr 固定输出名：<音频名>.json
@@ -360,7 +406,7 @@ def transcribe_and_write_article(stem_dir: Path, stem: str, force: bool,
     opts 键：threshold / diarize_engine / hotwords / names / srt / engine / extra / verbose
     返回 'done' / 'skip' / 'novoice' / 'redocx'（md 已在，仅补排版）"""
     opts = opts or {}
-    out_stem = f"会议原文-{stem}" if meeting else f"转写文稿-{stem}"
+    out_stem = f"会议原文-{stem}" if (meeting or opts.get("split_channels")) else f"转写文稿-{stem}"
     md_path = stem_dir / f"{out_stem}.md"
     docx_path = stem_dir / f"{out_stem}.docx"
     if md_path.exists() and not force:
@@ -381,7 +427,20 @@ def transcribe_and_write_article(stem_dir: Path, stem: str, force: bool,
                    "agate=threshold=-40dB:ratio=99:attack=2:release=100",
                    str(vocals_asr)], env=child_env())
     print(f"[转写] {stem}：说话人分离转写中（首次较慢；命中缓存直接复用）")
-    payload = call_asr(vocals_asr, opts, force)
+    # 降噪评估：粗估信噪比并给建议。不自动开降噪——实测白噪声场景无收益甚至更差，
+    # 只在真实低信噪素材上才值得试，所以给提示而不是替用户决定。
+    snr = estimate_snr_db(vocals_asr)
+    if snr is not None and snr < 15:
+        print(f"[提示] {stem}：估计信噪比约 {snr:.0f} dB（偏低），可试 --denoise；"
+              f"但白噪声场景实测无收益，仅真实含 BGM/强噪素材值得试", file=sys.stderr)
+    payload = None
+    if opts.get("split_channels"):
+        payload = split_channels_payload(stem_dir, force, opts)
+        if payload is None:
+            print("[提示] --split-channels 需要立体声素材，本次源是单声道，按普通模式处理",
+                  file=sys.stderr)
+    if payload is None:
+        payload = call_asr(vocals_asr, opts, force)
     # 说话人结果自检：默认 campp 在语音段不足 2 段时会跳过聚类，把所有人归到说话人 0；
     # 这时给出可执行的下一步，而不是让用户拿着错误的单一说话人继续用
     spk_ids = {l.get("spk") for l in (payload.get("lines") or [])}
@@ -390,7 +449,8 @@ def transcribe_and_write_article(stem_dir: Path, stem: str, force: bool,
         print("[提示] 本次只输出 1 个说话人：campp 声纹聚类在语音段不足时会跳过聚类。"
               "如需区分说话人，可加 --meeting 或 --diarize-engine pyannote 并用 --force 重跑",
               file=sys.stderr)
-    md_body = meeting_md(payload, stem) if meeting else transcript_md(payload, stem)
+    use_labels = meeting or bool(opts.get("split_channels"))
+    md_body = meeting_md(payload, stem) if use_labels else transcript_md(payload, stem)
     if not md_body:
         return "novoice"
     md_path.write_text(md_body, encoding="utf-8")
@@ -403,6 +463,46 @@ def transcribe_and_write_article(stem_dir: Path, stem: str, force: bool,
     return "done"
 
 
+def probe_channels(media: Path) -> int:
+    """取音频流声道数；读不到返回 0"""
+    out = run_output(["ffprobe", "-v", "error", "-select_streams", "a:0",
+                      "-show_entries", "stream=channels", "-of", "csv=p=0", str(media)])
+    try:
+        return int(out.strip().splitlines()[0])
+    except (ValueError, IndexError):
+        return 0
+
+
+def split_channels_payload(stem_dir: Path, force: bool, opts: dict):
+    """按声道分轨转写：左右声道各转一遍，把声道号直接当说话人编号再按时间轴合并。
+
+    适用的素材形态是双人分声道录制（电话录音、双麦、部分会议系统）——这类素材本可
+    靠声道区分说话人，而原先 qwen_asr 会先 mean(axis=1) 下混成单声道，白丢这层信息，
+    只能退回声纹聚类。返回 None 表示源不是立体声，调用方应回退普通路径。
+    """
+    src = stem_dir / "人声_转写用.wav"
+    if probe_channels(src) < 2:
+        return None
+    ch_paths = [stem_dir / "声道_0.wav", stem_dir / "声道_1.wav"]
+    if force or not all(p.exists() for p in ch_paths):
+        print("[分轨] 按声道拆成两路单声道，分别转写")
+        run_child(["ffmpeg", "-y", "-i", str(src),
+                   "-filter_complex", "channelsplit=channel_layout=stereo[l][r]",
+                   "-map", "[l]", str(ch_paths[0]),
+                   "-map", "[r]", str(ch_paths[1])], env=child_env())
+    lines = []
+    for idx, p in enumerate(ch_paths):
+        if (wav_rms_db(p) or -999) < -60:      # 整条声道接近静音，跳过
+            continue
+        payload = call_asr(p, opts, force, tag=f"ch{idx}")
+        for ln in (payload.get("lines") or []):
+            item = dict(ln)
+            item["spk"] = idx                  # 声道号即说话人号
+            lines.append(item)
+    lines.sort(key=lambda x: x.get("start_ms", 0))
+    return {"lines": lines}
+
+
 def separate_one(media: Path, out_dir: Path, force: bool, do_asr: bool = True,
                  meeting: bool = False, opts: dict = None,
                  no_separate: bool = False) -> str:
@@ -410,7 +510,12 @@ def separate_one(media: Path, out_dir: Path, force: bool, do_asr: bool = True,
     stem_dir = out_dir / media.stem
     is_audio = media.suffix.lower() in AUDIO_EXTS
     separated = (stem_dir / "人声.wav").exists() and (stem_dir / "背景音.wav").exists()
-    out_stem = f"会议原文-{media.stem}" if meeting else f"转写文稿-{media.stem}"
+    # 分离模型纳入幂等判定：同一目录若换过模型，要按新模型重跑，不能直接复用旧产物
+    demucs_model = opts.get("demucs_model") or "htdemucs"
+    marker = stem_dir / ".demucs_model"
+    same_model = marker.is_file() and marker.read_text(encoding="utf-8").strip() == demucs_model
+    out_stem = (f"会议原文-{media.stem}" if (meeting or opts.get("split_channels"))
+                else f"转写文稿-{media.stem}")
     md_exists = (stem_dir / f"{out_stem}.md").exists()
     docx_exists = (stem_dir / f"{out_stem}.docx").exists()
     # md 为完成标记；但只有 md 而缺 docx（首跑时未装 article-format）不算完成，
@@ -451,24 +556,35 @@ def separate_one(media: Path, out_dir: Path, force: bool, do_asr: bool = True,
                        str(audio_out)], env=child_env())
 
     # 2) Demucs 人声/背景音分离（--no-separate 时跳过：纯人声音频直接转码为人声.wav 供下游复用）
-    if no_separate:
+    if no_separate or opts.get("split_channels"):
+        # 分轨模式必须跳过 Demucs：它按立体声混音做人声分离，会打破左右声道的独立性，
+        # 而分轨的全部价值就在于两路声道各自干净
         vocals_out = stem_dir / "人声.wav"
         if force or not vocals_out.exists():
-            print(f"[转码] {media.name}：跳过人声分离，直接转 44.1kHz 立体声 wav")
+            why = "分轨模式跳过分离" if opts.get("split_channels") else "跳过人声分离"
+            print(f"[转码] {media.name}：{why}，直接转 44.1kHz 立体声 wav")
             run_child(["ffmpeg", "-y", "-i", str(media), "-ac", "2", "-ar", "44100",
                        str(vocals_out)], env=child_env())
-    elif force or not separated:
+    elif force or not separated or not same_model:
         tmp = out_dir / "_demucs_tmp"
         shutil.rmtree(tmp, ignore_errors=True)
-        print(f"[分离] {media.name}：Demucs 人声/背景音分离（GPU，耗时随时长增长）")
+        print(f"[分离] {media.name}：Demucs({demucs_model}) 人声/背景音分离（GPU，耗时随时长增长）")
         # demucs 的进度条有实际参考价值，始终实时透传（不捕获）
-        run_child(["demucs", "-n", "htdemucs", "--two-stems=vocals",
+        run_child(["demucs", "-n", demucs_model, "--two-stems=vocals",
                    "-o", str(tmp), str(media)], verbose=True, env=child_env())
         # demucs 固定输出 vocals.wav / no_vocals.wav，移入输出目录时改成自说明中文名
         rename = {"vocals.wav": "人声.wav", "no_vocals.wav": "背景音.wav"}
-        for f in (tmp / "htdemucs" / media.stem).glob("*.wav"):
+        # demucs 把模型名写进输出子目录，单模型与 bag 都取实际目录名，避免硬编码
+        produced = [d for d in (tmp.iterdir()) if d.is_dir()] if tmp.is_dir() else []
+        src_dir = produced[0] if produced else (tmp / demucs_model)
+        for f in (src_dir / media.stem).glob("*.wav"):
             shutil.move(str(f), str(stem_dir / rename.get(f.name, f.name)))
         shutil.rmtree(tmp, ignore_errors=True)
+        marker.write_text(demucs_model, encoding="utf-8")
+        # 曾想用「人声与背景音的能量差」自动判断素材本来就干净（好提示用户跳过分离），
+        # 对照实验证明不可行：纯人声 TTS 差值 15.1 dB、人声+440Hz 背景乐 12.7 dB，
+        # 两者只差 2.4 dB，该判据区分不出有没有背景，故不实现（避免给出误导性建议）。
+        # 需要跳过分离时仍由用户手动加 --no-separate。
 
     # 3) 人声转文字 + 文章/纪要排版（--no-asr 可跳过）
     if do_asr:
@@ -495,6 +611,11 @@ def main():
     ap.add_argument("--no-asr", action="store_true", help="只拆轨+人声分离，不转写不生成文稿")
     ap.add_argument("--no-separate", action="store_true",
                     help="跳过人声/背景音分离（纯人声音频适用，直接进转写）")
+    ap.add_argument("--demucs-model", default="htdemucs",
+                    choices=["htdemucs", "htdemucs_ft", "mdx_extra", "mdx_extra_q",
+                             "hdemucs_mmi", "htdemucs_6s"],
+                    help="人声分离模型：htdemucs 默认；htdemucs_ft 是官方微调版，质量更好但慢约 4 倍；"
+                         "mdx_extra 更强但可能引入伪影。换模型会按新模型重跑分离")
     ap.add_argument("--meeting", action="store_true",
                     help="产出会议原文（带时间戳；默认产出转写文稿。转写恒带说话人分离）")
     ap.add_argument("--diarize-engine", choices=["campp", "pyannote", "auto"], default="auto",
@@ -510,8 +631,20 @@ def main():
                     help="说话人改名（如 '0=赵总,1=张会计'）——会议原文的说话人标签将显示真实姓名")
     ap.add_argument("--srt", action="store_true",
                     help="额外产出 .srt 字幕（同名，含字级时间戳；加载 fa-zh 对齐模型）")
-    ap.add_argument("--asr-engine", choices=["qwen", "aed"], default="qwen",
-                    help="识别引擎：qwen=Qwen3-ASR-1.7B（默认，多语言）；aed=FireRedASR2-AED（中/英/粤更准）")
+    ap.add_argument("--asr-engine", choices=["qwen", "aed", "auto"], default="qwen",
+                    help="识别引擎：qwen=Qwen3-ASR-1.7B（默认，多语言）；aed=FireRedASR2-AED（中/英/粤更准）；"
+                         "auto=按 --language 路由（中/英/粤走 aed，其余走 qwen）")
+    ap.add_argument("--itn", action="store_true",
+                    help="中文逆文本正则化：三百二十万元->320万元、百分之八十->80%%，"
+                         "二零二六年十月十五日->2026年10月15日（自写规则，零依赖）")
+    ap.add_argument("--split-channels", action="store_true",
+                    help="按声道分轨转写：双人分声道录制（电话/双麦）把左右声道当两个说话人，"
+                         "输出带说话人标签的文稿；会自动跳过 Demucs 与声纹聚类，非立体声回退普通模式")
+    ap.add_argument("--emotion", action="store_true",
+                    help="emotion2vec 整段情绪分析（8 类情绪写入结果 json 的 emotions 字段；不做笑声/掌声事件检测）")
+    ap.add_argument("--speaker-db", default=None,
+                    help="声纹库 JSON 路径：跨文件复用说话人身份（仅 campp 引擎可用）；"
+                         "首次用 --asr-extra \"--speaker-db-save\" 建库")
     ap.add_argument("--replace", default=None,
                     help="专名/错词确定性纠错（如 '小蜜=>小米,开饭时间=>开放时间'）——"
                          "比 --hotwords 的 prompt 偏置可靠；变更后自动用新缓存重转")
@@ -559,13 +692,17 @@ def main():
     # 额外 ASR 参数：显式项 + --asr-extra 合并，统一进命令行与缓存键
     extra = []
     for flag, val in (("--replace", args.replace), ("--replace-file", args.replace_file),
-                      ("--language", args.language),
+                      ("--language", args.language), ("--speaker-db", args.speaker_db),
                       ("--max-line", args.max_line), ("--merge-gap", args.merge_gap),
                       ("--vad", args.vad)):
         if val is not None:
             extra += [flag, str(val)]
     if args.denoise:
         extra.append("--denoise")
+    if args.itn:
+        extra.append("--itn")
+    if args.emotion:
+        extra.append("--emotion")
     if args.asr_extra:
         extra += split_asr_extra(args.asr_extra)
     for bad in RESERVED_ASR_ARGS:
@@ -574,7 +711,8 @@ def main():
     opts = {"threshold": args.threshold, "diarize_engine": diarize_engine,
             "hotwords": args.hotwords, "names": args.names, "srt": args.srt,
             "engine": args.asr_engine if args.asr_engine != "qwen" else None,
-            "extra": extra, "verbose": args.verbose, "clean": args.clean}
+            "extra": extra, "verbose": args.verbose, "clean": args.clean,
+            "demucs_model": args.demucs_model, "split_channels": args.split_channels}
 
     # 日志落盘：终端与 run.log 双写，批量跑完还能回溯
     log_path = None

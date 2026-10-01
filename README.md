@@ -41,6 +41,10 @@ python av_to_transcript_and_minutes.py <视频/音频文件或文件夹> [-o 输
 - **批量容错与可观测**：单个文件失败只计一次失败并继续（素材损坏、缺 ffmpeg/demucs 都不中断整批）；无音轨素材单独归类提示；批量打印 `[i/N]` 计数与每个素材用时，收尾给总耗时与均值；`--log` 把运行输出落到 `<输出目录>/run.log`
 - **跑前自检与提示**：跑前查显存，可用量低于 4 GB 时提示先停占卡程序或用 `--no-separate`；转写只得到 1 个说话人且用的是默认 campp 时，提示可改用 `--meeting` 或 pyannote 重跑
 - **磁盘可控**：`--clean` 完成后删除中间件（三份 wav 与转写缓存 json），只留成稿，长素材不再动辄留下上 GB 的中间 wav
+- **模型层可选与增强**：`--asr-engine auto` 按语言路由（中/英/粤走 FireRedASR2-AED，其余走 Qwen3-ASR）；`--vad firered` 用误报更低的 FireRedVAD 切段；`--demucs-model` 可选 htdemucs / htdemucs_ft / mdx_extra 等分离模型（换模型自动重跑）
+- **输出规范化**：`--itn` 中文逆文本正则化（三百二十万元 → 320万元、二零二六年十月十五日 → 2026年10月15日），零依赖自写规则
+- **双人分声道素材**：`--split-channels` 按声道分轨转写，声道号直接当说话人，省掉声纹聚类、也不会把两人混在一起
+- **情绪与声纹**：`--emotion` 出 8 类情绪打分（写入 json 的 `emotions` 字段；**不做**笑声/掌声等音频事件检测）；`--speaker-db` 声纹库跨文件复用说话人身份（首次用 `--speaker-db-save` 建库）
 - **批量处理**：输入文件夹时递归处理其中所有音视频
 
 ---
@@ -113,6 +117,12 @@ python av_to_transcript_and_minutes.py ./素材目录 --meeting --srt \
 | `--clean` | 完成后删除中间件（三份 wav 与转写缓存 json），只留成稿；对已完成素材也生效 |
 | `--log` | 本次运行输出追加写入 `<输出目录>/run.log` |
 | `--replace-file 词典.txt` | 纠错词典文件（每行 `错=>对`） |
+| `--itn` | 中文逆文本正则化：三百二十万元 → 320万元、百分之八十 → 80%、二零二六年十月十五日 → 2026年10月15日 |
+| `--asr-engine auto` | 按 `--language` 路由识别引擎（中/英/粤走 AED，其余走 Qwen） |
+| `--demucs-model NAME` | 分离模型：`htdemucs`（默认）／`htdemucs_ft`（质量更好、慢约 4 倍）／`mdx_extra` 等；换模型自动重跑分离 |
+| `--split-channels` | 双人分声道素材按声道分轨转写，声道号即说话人；自动跳过 Demucs 与声纹聚类 |
+| `--emotion` | emotion2vec 输出 8 类情绪打分（写 json 的 `emotions`；不做笑声/掌声等事件检测） |
+| `--speaker-db db.json` | 声纹库：跨文件复用说话人身份（仅 campp 引擎）；建库加 `--asr-extra "--speaker-db-save"` |
 | `--force` | 重跑已处理过的素材 |
 | `-o 输出目录` | 指定输出目录（默认输入旁 `separated_out/`） |
 
