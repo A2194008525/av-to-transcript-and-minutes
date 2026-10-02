@@ -28,7 +28,8 @@
   --srt                   额外产出字级时间戳字幕
   --asr-engine aed        换识别引擎（中/英/粤更准）；换引擎会自动用新缓存重转，不复用旧结果
   --replace "错=>对"       确定性专名纠错（同音异字可配 --asr-extra "--fuzzy"），比热词偏置可靠
-  --replace-file 词典.txt  纠错词典文件，每行一条 "错=>对"
+  --replace-file [词典.txt]  纠错词典（每行 "错=>对"）；裸写=用输出目录 replace_dict.txt
+  --replace-save [词典.txt]  把本次纠错条目合并写回词典（裸写=输出目录 replace_dict.txt），下次 --replace-file 裸写即自动带上
   --denoise               转写前 ZipEnhancer 降噪（仅真实含 BGM/强噪素材）
   --vad firered           改 VAD 后端（默认 fsmn）
   --asr-extra "--min-seg 300"  其余 qwen_asr 参数原样透传
@@ -240,6 +241,18 @@ def estimate_snr_db(path: Path):
         return 20 * math.log10(max(speech, 1e-9) / max(noise, 1e-9))
     except Exception:
         return None
+
+
+def decode_16k_mono_tmp(media: Path):
+    """ffmpeg 把任意容器解码为 16k mono wav 临时文件（供分离前 SNR 探测，视频/音频通用）。
+    失败返回 None，不阻断主流程。"""
+    import tempfile
+    out = Path(tempfile.gettempdir()) / f"snr_probe_{media.stem[:40]}_{os.getpid()}.wav"
+    r = subprocess.run(["ffmpeg", "-y", "-v", "error", "-i", str(media), "-ac", "1",
+                        "-ar", "16000", str(out)], capture_output=True)
+    if r.returncode != 0 or not out.is_file():
+        return None
+    return out
 
 
 def asr_script() -> Path:
@@ -566,6 +579,16 @@ def separate_one(media: Path, out_dir: Path, force: bool, do_asr: bool = True,
             run_child(["ffmpeg", "-y", "-i", str(media), "-ac", "2", "-ar", "44100",
                        str(vocals_out)], env=child_env())
     elif force or not separated or not same_model:
+        # 分离前对原始素材粗估信噪比（分位法；校准：纯人声 25.9 dB、人声+0.15 粉噪 14.6 dB），
+        # 明显纯净时提示可 --no-separate 省 Demucs。只提示不自动跳——判据是相对估计，
+        # 误判的代价是转写变差，宁多跑一次分离（与已证伪的「人声/背景音能量差」判据不同）。
+        probe = decode_16k_mono_tmp(media)
+        if probe is not None:
+            snr0 = estimate_snr_db(probe)
+            probe.unlink(missing_ok=True)
+            if snr0 is not None and snr0 >= 25:
+                print(f"[提示] {media.name}：原始素材估计信噪比约 {snr0:.0f} dB（较纯净），"
+                      f"可加 --no-separate 跳过 Demucs 提速")
         tmp = out_dir / "_demucs_tmp"
         shutil.rmtree(tmp, ignore_errors=True)
         print(f"[分离] {media.name}：Demucs({demucs_model}) 人声/背景音分离（GPU，耗时随时长增长）")
@@ -642,9 +665,9 @@ def main():
                          "输出带说话人标签的文稿；会自动跳过 Demucs 与声纹聚类，非立体声回退普通模式")
     ap.add_argument("--emotion", action="store_true",
                     help="emotion2vec 整段情绪分析（8 类情绪写入结果 json 的 emotions 字段；不做笑声/掌声事件检测）")
-    ap.add_argument("--speaker-db", default=None,
-                    help="声纹库 JSON 路径：跨文件复用说话人身份（仅 campp 引擎可用）；"
-                         "首次用 --asr-extra \"--speaker-db-save\" 建库")
+    ap.add_argument("--speaker-db", nargs="?", const="auto", default=None,
+                    help="声纹库：跨文件复用说话人身份（仅 campp 引擎可用）。裸写或 auto=输出目录 "
+                         "speaker_db.json（有则复用无则建库、命中自动更新）；也可给显式 JSON 路径")
     ap.add_argument("--replace", default=None,
                     help="专名/错词确定性纠错（如 '小蜜=>小米,开饭时间=>开放时间'）——"
                          "比 --hotwords 的 prompt 偏置可靠；变更后自动用新缓存重转")
@@ -668,8 +691,10 @@ def main():
                          "只留成稿 md/docx/srt；拆轨产物保留")
     ap.add_argument("--log", action="store_true",
                     help="把本次运行输出追加写入 <输出目录>/run.log，便于批量跑完回溯")
-    ap.add_argument("--replace-file", default=None,
-                    help="专名纠错词典文件（每行 '错=>对'），等价于 qwen_asr.py 的同名参数")
+    ap.add_argument("--replace-file", nargs="?", const="auto", default=None,
+                    help="纠错词典文件（每行 '错=>对'）；裸写或 auto=输出目录 replace_dict.txt")
+    ap.add_argument("--replace-save", nargs="?", const="auto", default=None,
+                    help="把本次纠错条目合并写回词典（裸写或 auto=输出目录 replace_dict.txt，键同新值覆盖）")
     args = ap.parse_args()
 
     src = Path(args.input)
@@ -689,14 +714,21 @@ def main():
     # auto：会议模式走 pyannote（重叠语音更准），其余走 campp（轻量）
     diarize_engine = ("pyannote" if args.meeting else None) \
         if args.diarize_engine == "auto" else args.diarize_engine
+    # auto 持久化文件统一放输出目录（跨素材共享同一份库/词典），解析成显式路径再透传
+    speaker_db_arg = str(out_dir / "speaker_db.json") if args.speaker_db == "auto" else args.speaker_db
+    replace_file_arg = str(out_dir / "replace_dict.txt") if args.replace_file == "auto" else args.replace_file
+    replace_save_arg = str(out_dir / "replace_dict.txt") if args.replace_save == "auto" else args.replace_save
     # 额外 ASR 参数：显式项 + --asr-extra 合并，统一进命令行与缓存键
     extra = []
-    for flag, val in (("--replace", args.replace), ("--replace-file", args.replace_file),
-                      ("--language", args.language), ("--speaker-db", args.speaker_db),
+    for flag, val in (("--replace", args.replace), ("--replace-file", replace_file_arg),
+                      ("--replace-save", replace_save_arg),
+                      ("--language", args.language), ("--speaker-db", speaker_db_arg),
                       ("--max-line", args.max_line), ("--merge-gap", args.merge_gap),
                       ("--vad", args.vad)):
         if val is not None:
             extra += [flag, str(val)]
+    if args.speaker_db == "auto":
+        extra.append("--speaker-db-save")   # auto=有库复用无库建库，命中/新增都更新库
     if args.denoise:
         extra.append("--denoise")
     if args.itn:
