@@ -55,6 +55,7 @@ python qwen_asr.py 长录音.m4a --hotwords "热词A,热词B"   # 热词偏置�
 输出：stdout 全文；音频同目录落 `.json`（结构化：segments / sentences）；`--srt` 时额外落 `.srt`。
 其余参数：`--language zh` 强制语言、`--threshold 0.7` 聚类阈值、`--merge-gap 800` 同人碎段合并间隔（ms）、
 `--max-line 28` 单条字幕最大字数、`--device cpu`、`--no-t2s` 关繁转简、`--replace-file` 用词典文件。
+输入为 m4a/AAC 等 libsndfile 读不了的容器时，入口自动用 ffmpeg 转 16k mono wav 再进链路（stderr 提示 `[0]`；mp3/wav/flac 原生可读不受影响）。
 
 ### transcribe.py — FunASR 原生通道（备选）
 
@@ -86,7 +87,7 @@ python diarize.py 访谈录音.m4a --threshold 0.7
 11. **同一目录内有多份待转写音频时，缓存键必须带 tag**：否则两路声道会命中同一份缓存、转出完全相同的文本（实测踩过）。
 12. **「素材是否本来就干净」无法用能量差判断**（对照实验证伪，勿再尝试）：纯人声差 15.1 dB、人声+背景乐差 12.7 dB，只差 2.4 dB，判据区分不出有无背景。需要跳过分离时手动 `--no-separate`。
 13. **emotion2vec 只做情绪识别，不做音频事件检测**：它输出 8 类情绪（开心/难过/厌恶/中立/生气/惊讶/害怕/兴奋）的整段打分；笑声、掌声这类事件识别不了，需要另装事件检测模型。
-14. **声纹库只在 campp 引擎下可用**：pyannote 路径不产出声纹向量，加了 `--speaker-db` 会提示并跳过；建库用 `--speaker-db-save`，命中阈值默认 0.75（同人被认成新人就调低）。
+14. **声纹库只在 campp 引擎下可用**：pyannote 路径不产出声纹向量，加了 `--speaker-db` 会提示并跳过；裸写或 `--speaker-db auto`=用音频同目录（链路场景为输出目录）speaker_db.json，有则复用无则建库、命中自动更新；显式路径建库仍用 `--speaker-db-save`；命中阈值默认 0.75（同人被认成新人就调低）。
 
 ## 环境自检
 
@@ -123,7 +124,7 @@ python av_to_transcript_and_minutes.py 录像.mp4 --asr-engine auto --language z
 python av_to_transcript_and_minutes.py 录像.mp4 --demucs-model htdemucs_ft       # 分离质量优先（慢约 4 倍）
 python av_to_transcript_and_minutes.py 双人录音.wav --split-channels             # 双人分声道录制：声道号即说话人
 python av_to_transcript_and_minutes.py 录音.wav --emotion                        # 8 类情绪分析（写 json 的 emotions）
-python av_to_transcript_and_minutes.py 会议.wav --speaker-db db.json             # 跨文件复用说话人身份
+python av_to_transcript_and_minutes.py 会议.wav --speaker-db             # 声纹库 auto：输出目录 speaker_db.json 有则复用无则建库（也可给显式路径）
 python av_to_transcript_and_minutes.py 录像.mp4 --verbose        # 实时看各子进程输出，排查卡顿/失败
 ```
 
@@ -134,6 +135,10 @@ python av_to_transcript_and_minutes.py 录像.mp4 --verbose        # 实时看�
 - `--clean` 完成后删除中间件（三份 wav 与转写缓存 json），只留成稿；对已完成素材加 `--clean` 也会顺手清理残留。注意缓存被删后换参数重转会重新走一遍分离。
 - `--log` 把运行输出追加写入 `<输出目录>/run.log`（终端与文件双写）。
 - 跑前查显存，可用量低于 4 GB 时提示先停其它占卡程序或用 `--no-separate`。
+- 转写前粗估信噪比，低于 15 dB 时提示可试 `--denoise`（只提示不自动开——白噪声场景实测无收益，只在真实含 BGM/强噪素材上值得试）。
+- 分离前对原始素材粗估信噪比（分位法），≥25 dB（校准：纯人声 25.9）时提示可加 `--no-separate` 跳过 Demucs 提速（只提示不自动跳）。
+- `--speaker-db` 裸写（auto）：库放输出目录 `speaker_db.json`，批内跨素材共享，命中显示库中姓名并更新声纹；库更新后重转同一素材需 `--force`（路径恒定，不触发缓存重转）。
+- `--replace-save`：把本次 `--replace`/`--replace-file` 条目合并写回词典（裸写=输出目录 `replace_dict.txt`，键同新值覆盖、注释保留）；下次 `--replace-file` 裸写自动带上，专名修正可积累。
 - 素材无音轨（或音频损坏）归类为「无音轨」单独计数，不再整段抛 ffmpeg 原始输出。
 - 转写后只得到 1 个说话人、且用的是默认 campp 时，提示可改用 `--meeting` 或 pyannote 重跑。
 - 批量打印 `[i/N]` 计数与每个素材用时，收尾给总耗时与均值。

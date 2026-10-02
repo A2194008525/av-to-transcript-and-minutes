@@ -682,6 +682,51 @@ def maybe_denoise(audio_path, enabled, log):
     return str(out)
 
 
+def ensure_libsndfile_readable(src: str, log=print) -> str:
+    """libsndfile（soundfile/librosa 的底层）不解 m4a/AAC 等容器，直喂报 Format not
+    recognised（2026-09-23 实测）。可读则原样返回；读不了用 ffmpeg 解码为 16k mono
+    wav 临时文件并返回其路径（ffmpeg 缺失或解码失败返回空串，由调用方终止）。"""
+    import soundfile as sf
+    try:
+        sf.info(src)
+        return src
+    except Exception:
+        pass
+    import subprocess
+    p = Path(src)
+    dst = Path(tempfile.gettempdir()) / f"qwen_asr_{p.stem[:60]}_{os.getpid()}_16k.wav"
+    log(f"[0] {p.suffix or '(无后缀)'} 容器 libsndfile 读不了，先用 ffmpeg 转 16k mono wav")
+    r = subprocess.run(["ffmpeg", "-y", "-v", "error", "-i", src, "-ac", "1",
+                        "-ar", "16000", str(dst)], capture_output=True)
+    if r.returncode != 0 or not dst.is_file():
+        log("ffmpeg 解码失败: " + r.stderr.decode("utf-8", "replace")[-400:])
+        return ""
+    return str(dst)
+
+
+def merge_replace_dict(path: str, items: dict) -> int:
+    """把纠错条目合并写回词典文件：键相同以新值覆盖，# 注释与未知行原样保留，
+    新增键追加到文件尾部。返回本次合并的条目数。"""
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    pending = dict(items)
+    out_lines = []
+    if p.is_file():
+        for line in p.read_text(encoding="utf-8").splitlines():
+            s = line.strip()
+            if "=>" in s and not s.startswith("#"):
+                k, _, _v = s.partition("=>")
+                k = k.strip()
+                if k in pending:
+                    out_lines.append(f"{k}=>{pending.pop(k)}")
+                    continue
+            out_lines.append(line)
+    for k, v in pending.items():
+        out_lines.append(f"{k}=>{v}")
+    p.write_text("\n".join(out_lines) + "\n", encoding="utf-8")
+    return len(items)
+
+
 def main():
     ap = argparse.ArgumentParser(description="Qwen3-ASR 本地转写（可说话人分离/字幕/专名纠错）")
     ap.add_argument("audio", help="音频文件路径(mp3/m4a/wav/flac/ogg/webm)")
@@ -690,7 +735,10 @@ def main():
                     help="强制语言:代码(zh/en/yue/ja...)或全名(Chinese/English...),默认自动检测")
     ap.add_argument("--hotwords", default=None, help="热词/上下文,逗号分隔,作为 system prompt 偏置识别")
     ap.add_argument("--replace", default=None, help="专名纠错,如 '开饭时间=>开放时间,小蜜=>小米'（确定性替换）")
-    ap.add_argument("--replace-file", default=None, help="纠错词典文件(每行 '错=>对' 或 目标词)")
+    ap.add_argument("--replace-file", nargs="?", const="auto", default=None,
+                    help="纠错词典文件(每行 '错=>对' 或 目标词);裸写或 auto=用音频同目录 replace_dict.txt(无则空基座不报错)")
+    ap.add_argument("--replace-save", nargs="?", const="auto", default=None,
+                    help="把本次纠错条目合并写回词典:裸写或 auto=音频同目录 replace_dict.txt,也可给显式路径(键相同以新值为准)")
     ap.add_argument("--fuzzy", action="store_true", help="纠错启用拼音模糊匹配（需 pypinyin+rapidfuzz）")
     ap.add_argument("--srt", action="store_true", help="额外输出 .srt 字幕（加载 fa-zh 强制对齐出字级时间戳）")
     ap.add_argument("--max-line", type=int, default=28, help="单条字幕最大字数(默认28)")
@@ -719,11 +767,12 @@ def main():
     ap.add_argument("--emotion", action="store_true",
                     help="emotion2vec+large 整段情绪分析(8 类情绪,结果写入 json 的 emotions 字段);"
                          "注意它不做笑声/掌声这类音频事件检测")
-    ap.add_argument("--speaker-db", default=None,
-                    help="声纹库 JSON 路径:跨文件复用说话人身份,命中已知声纹时直接显示库中姓名"
+    ap.add_argument("--speaker-db", nargs="?", const="auto", default=None,
+                    help="声纹库 JSON 路径:跨文件复用说话人身份,命中已知声纹时直接显示库中姓名;"
+                         "裸写或 auto=用音频同目录 speaker_db.json(有则复用无则自动建库、命中后更新)"
                          "(仅 campp 引擎可用;pyannote 路径不产声纹向量)")
     ap.add_argument("--speaker-db-save", action="store_true",
-                    help="把本次识别到的说话人声纹写入 --speaker-db 指定的库(同名覆盖)")
+                    help="把本次识别到的说话人声纹写入 --speaker-db 指定的库(同名覆盖;auto 模式自动保存,无需此参)")
     ap.add_argument("--speaker-db-threshold", type=float, default=0.75,
                     help="声纹库命中阈值(余弦相似度,默认 0.75;同人被认成新人的话调低)")
     ap.add_argument("--device", default="cuda:0", help="推理设备,无 N 卡用 cpu")
@@ -768,20 +817,29 @@ def main():
         if p.parent != audio_path.parent:
             sys.exit("输出路径越出音频目录,已终止")
     hotwords = "、".join(w.strip() for w in args.hotwords.split(",") if w.strip()) if args.hotwords else None
+    # auto 持久化文件用音频同目录（单用场景；管线场景由 separate 解析成显式路径透传）
+    replace_file_arg = args.replace_file
+    if args.replace_file == "auto":
+        replace_file_arg = str(audio_path.parent / "replace_dict.txt")
+    speaker_db_path = args.speaker_db
+    speaker_db_save = args.speaker_db_save or args.speaker_db == "auto"
+    if args.speaker_db == "auto":
+        speaker_db_path = str(audio_path.parent / "speaker_db.json")
     replace_map = {}
-    if args.replace_file:
-        p = Path(os.path.realpath(args.replace_file))
-        if not p.is_file():
+    if replace_file_arg:
+        p = Path(os.path.realpath(replace_file_arg))
+        if p.is_file():
+            for line in p.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=>" in line:
+                    k, v = line.split("=>", 1)
+                    replace_map[k.strip()] = v.strip()
+                else:
+                    replace_map[line] = line
+        elif args.replace_file != "auto":
             sys.exit(f"纠错词典文件不存在: {p}")
-        for line in p.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            if "=>" in line:
-                k, v = line.split("=>", 1)
-                replace_map[k.strip()] = v.strip()
-            else:
-                replace_map[line] = line
     if args.replace:
         for item in args.replace.replace("；", ";").replace(";", ",").split(","):
             if "=>" in item:
@@ -800,12 +858,21 @@ def main():
     def log(msg):
         print(msg, file=sys.stderr, flush=True)
 
+    if args.replace_save and replace_map:
+        save_path = (str(audio_path.parent / "replace_dict.txt")
+                     if args.replace_save == "auto" else args.replace_save)
+        merge_replace_dict(save_path, replace_map)
+        log(f"[0] 纠错词典已合并写回: {save_path}")
+
     use_aed = args.engine == "aed"
     work_dir = Path(tempfile.mkdtemp(prefix="qwen_asr_")).resolve()
+    src0 = ensure_libsndfile_readable(str(audio_path), log)
+    if not src0:
+        sys.exit("输入音频无法读取（ffmpeg 解码失败，见上方日志）")
     if args.denoise:
-        src = maybe_denoise(audio_path, True, log)
+        src = maybe_denoise(src0, True, log)
     else:
-        src = str(audio_path)
+        src = src0
     import librosa, soundfile as sf
     preloaded_audio = None
     # AED 只吃 16k wav;为统一,两种引擎都先落到工作目录的 16k wav(顺便完成格式归一)
@@ -1014,13 +1081,13 @@ def main():
                                  for _ in range(len(units) - len(parsed))]
     # 声纹库：跨文件复用说话人身份（同一批会议里不必每次都重新认人）
     db_names = {}
-    if args.speaker_db:
+    if speaker_db_path:
         emb = locals().get("embeddings")          # pyannote 路径不产声纹向量
         if emb is None or not len(labels):
             print("[提示] --speaker-db 只在 campp 引擎下可用（pyannote 路径不产声纹向量），本次跳过",
                   file=sys.stderr)
         else:
-            db = load_speaker_db(args.speaker_db)
+            db = load_speaker_db(speaker_db_path)
             cents = {}
             for c in sorted({int(x) for x in labels}):
                 member = emb[labels == c]
@@ -1031,11 +1098,11 @@ def main():
                 if hit:
                     db_names[c] = hit
                     log(f"[4c] 声纹库命中: 说话人{c} -> {hit}（相似度 {sim:.3f}）")
-            if args.speaker_db_save:
+            if speaker_db_save:
                 for c, cen in cents.items():
                     db[names.get(c) or db_names.get(c) or f"说话人{c}"] = cen
-                save_speaker_db(args.speaker_db, db)
-                log(f"[4c] 声纹库已更新: {args.speaker_db}（共 {len(db)} 条）")
+                save_speaker_db(speaker_db_path, db)
+                log(f"[4c] 声纹库已更新: {speaker_db_path}（共 {len(db)} 条）")
     for u, p in zip(units, parsed):
         u["text"] = p["transcription"]
         u["language"] = p.get("language")

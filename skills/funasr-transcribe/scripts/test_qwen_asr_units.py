@@ -126,6 +126,57 @@ check("全为大簇不吸收", out2.tolist() == [0, 1], f"got {out2.tolist()}")
 out3 = absorb_tiny_clusters(emb, np.array([0, 0, 0]), segs_t)
 check("单簇直接返回", out3.tolist() == [0, 0, 0], f"got {out3.tolist()}")
 
+print("[12] ensure_libsndfile_readable 容器兜底")
+import shutil, subprocess as sp, tempfile
+from pathlib import Path as _P
+import soundfile as sf
+from qwen_asr import ensure_libsndfile_readable
+tmpd = _P(tempfile.mkdtemp(prefix="asr_fmt_test_"))
+try:
+    wav = tmpd / "t.wav"
+    sf.write(str(wav), np.zeros(1600, dtype="float32"), 16000)
+    check("wav 可读原样返回", ensure_libsndfile_readable(str(wav), log=lambda m: None) == str(wav))
+    if shutil.which("ffmpeg"):
+        m4a = tmpd / "t.m4a"
+        r = sp.run(["ffmpeg", "-y", "-v", "error", "-i", str(wav), "-c:a", "aac", str(m4a)],
+                   capture_output=True)
+        if r.returncode == 0 and m4a.is_file():
+            native = True
+            try:
+                sf.info(str(m4a))
+            except Exception:
+                native = False
+            out = ensure_libsndfile_readable(str(m4a), log=lambda m: None)
+            if native:
+                check("m4a 原生可读则原样返回", out == str(m4a), f"out={out!r}")
+            else:
+                check("m4a 转出可读 wav",
+                      out != str(m4a) and out and sf.info(out).duration > 0, f"out={out!r}")
+        else:
+            print("  SKIP ffmpeg 无 aac 编码器")
+    else:
+        print("  SKIP 无 ffmpeg")
+finally:
+    shutil.rmtree(tmpd, ignore_errors=True)
+
+print("[13] merge_replace_dict 词典合并")
+from qwen_asr import merge_replace_dict
+tmpd2 = _P(tempfile.mkdtemp(prefix="asr_dict_test_"))
+try:
+    d = tmpd2 / "replace_dict.txt"
+    d.write_text("# 注释保留\n小蜜=>小米\n旧词=>旧值\n", encoding="utf-8")
+    n = merge_replace_dict(str(d), {"小蜜": "小米", "开饭时间": "开放时间"})
+    txt = d.read_text(encoding="utf-8")
+    check("返回合并条数", n == 2, f"n={n}")
+    check("已有键在位", "小蜜=>小米" in txt and "旧词=>旧值" in txt)
+    check("新增键追加", "开饭时间=>开放时间" in txt)
+    check("注释行保留", "# 注释保留" in txt)
+    merge_replace_dict(str(d), {"旧词": "新值"})
+    txt2 = d.read_text(encoding="utf-8")
+    check("同键新值覆盖", "旧词=>新值" in txt2 and "旧词=>旧值" not in txt2)
+finally:
+    shutil.rmtree(tmpd2, ignore_errors=True)
+
 print()
 if fails:
     print(f"FAILED: {len(fails)} 项 -> {fails}")
